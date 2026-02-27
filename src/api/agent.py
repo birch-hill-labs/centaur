@@ -27,7 +27,7 @@ HARNESSES = ("amp", "claude-code", "codex")
 EXEC_TIMEOUT = int(os.getenv("AGENT_EXEC_TIMEOUT", "600"))
 
 # Number of pre-warmed containers to keep ready
-POOL_SIZE = int(os.getenv("AGENT_POOL_SIZE", "2"))
+POOL_SIZE = int(os.getenv("AGENT_POOL_SIZE", "0"))
 
 # In-memory session registry: slack_thread_key → session dict
 _sessions: dict[str, dict[str, Any]] = {}
