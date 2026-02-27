@@ -21,7 +21,7 @@ from docker.errors import NotFound
 
 log = structlog.get_logger()
 
-HARNESSES = ("amp", "claude-code", "codex")
+HARNESSES = ("amp", "claude-code", "codex", "pi-mono")
 
 # Max seconds to wait for a single exec call before killing it
 EXEC_TIMEOUT = int(os.getenv("AGENT_EXEC_TIMEOUT", "600"))
@@ -171,7 +171,7 @@ def _create_container(
         detach=True,
         stdin_open=True,
         tty=False,
-        network_mode="host",
+        network=os.getenv("AGENT_NETWORK", "ai_v2_default"),
         mem_limit="4g",
         nano_cpus=int(2 * 1e9),
         environment=env,
@@ -238,7 +238,7 @@ def _container_env() -> list[str]:
         "GITHUB_TOKEN",
     ]
     env = [
-        f"AI_V2_API_URL={os.getenv('AI_V2_API_URL', 'http://localhost:8000')}",
+        f"AI_V2_API_URL={os.getenv('AGENT_API_URL', 'http://api:8000')}",
         f"AI_V2_API_KEY={os.getenv('API_SECRET_KEY', '')}",
     ]
     for k in keys:
@@ -273,6 +273,14 @@ def _build_command(harness: str, message: str, thread_id: str | None) -> list[st
             "--full-auto",
             "--skip-git-repo-check",
             *(["resume", thread_id] if thread_id else []),
+            message,
+        ]
+    if harness == "pi-mono":
+        return [
+            "pi",
+            "--mode",
+            "json",
+            *(["--session", thread_id] if thread_id else []),
             message,
         ]
     # Default: amp
@@ -323,6 +331,29 @@ def _extract_result(
                         result_text = item.get("text", result_text)
             elif etype == "error":
                 result_text = f"❌ {event.get('message', 'Unknown error')}"
+            continue
+
+        # Pi-mono normalization
+        if harness == "pi-mono":
+            etype = event.get("type", "")
+            if etype == "session":
+                agent_thread_id = event.get("id")
+            elif etype == "message_end":
+                msg = event.get("message", {})
+                if msg.get("role") == "assistant":
+                    for part in msg.get("content", []):
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            result_text = part.get("text", result_text)
+                        elif isinstance(part, str):
+                            result_text = part
+            elif etype == "agent_end":
+                for msg in event.get("messages", []):
+                    if msg.get("role") == "assistant":
+                        for part in msg.get("content", []):
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                result_text = part.get("text", result_text)
+                            elif isinstance(part, str):
+                                result_text = part
             continue
 
         # Amp / claude-code format
@@ -741,6 +772,7 @@ class AgentClient:
                 "amp": "amp",
                 "claude-code": "claude",
                 "codex": "codex",
+                "pi-mono": "pi",
             }.get(harness, "amp")
             container.exec_run(["pkill", "-INT", "-f", target], detach=True)
         except Exception:
