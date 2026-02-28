@@ -235,6 +235,33 @@ def _delete_session(key: str) -> None:
     _pg_write("DELETE FROM agent_sessions WHERE slack_thread_key = %s", (key,))
 
 
+def _post_to_slack_sync(thread_key: str, text: str) -> None:
+    """Post a message to a Slack thread. Best-effort, never raises."""
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    if not token or not text.strip():
+        return
+    try:
+        parts = thread_key.split(":")
+        if len(parts) < 2:
+            return
+        channel, thread_ts = parts[0], parts[-1]
+        safe_text = text.strip()
+        if len(safe_text) > 3900:
+            safe_text = safe_text[:3882].rstrip() + "\n\n... (truncated)"
+        with httpx.Client(timeout=20) as client:
+            resp = client.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"channel": channel, "thread_ts": thread_ts, "text": safe_text},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if not data.get("ok"):
+                    log.debug("slack_post_failed", error=data.get("error"))
+    except Exception as exc:
+        log.debug("slack_post_failed", error=str(exc))
+
+
 def _docker_client() -> docker.DockerClient:
     return docker.from_env()
 
@@ -1133,7 +1160,67 @@ class AgentClient:
             pass
 
         log.info("session_recovery_complete", recovered=recovered, pruned=pruned)
-        return {"recovered": recovered, "pruned": pruned}
+
+        # 3. Re-dispatch sessions that were in 'working' state (interrupted turns)
+        resumed = 0
+        for row in rows:
+            if row.get("state") != "working":
+                continue
+            key = row["slack_thread_key"]
+            session = get_session_state(key)
+            if not session:
+                continue
+
+            # Find the last unfinished turn
+            incomplete = _pg_read(
+                "SELECT * FROM agent_turns WHERE slack_thread_key = %s "
+                "AND finished_at IS NULL ORDER BY turn_id DESC LIMIT 1",
+                (key,),
+            )
+            if not incomplete:
+                # No incomplete turn — just fix PG state
+                _pg_write(
+                    "UPDATE agent_sessions SET state = 'idle' WHERE slack_thread_key = %s",
+                    (key,),
+                )
+                continue
+
+            interrupted_turn = incomplete[0]
+            user_message = interrupted_turn["user_message"]
+
+            # Mark the interrupted turn as failed
+            _pg_write(
+                "UPDATE agent_turns SET finished_at = now(), result = %s, exit_code = -1 "
+                "WHERE slack_thread_key = %s AND turn_id = %s AND finished_at IS NULL",
+                ("⚠️ Interrupted by API restart — retrying automatically.", key, interrupted_turn["turn_id"]),
+            )
+            # Also update the in-memory turn if present
+            for t in session.get("turns", []):
+                if t["turn_id"] == interrupted_turn["turn_id"] and not t.get("finished_at"):
+                    t["result"] = "⚠️ Interrupted by API restart — retrying automatically."
+                    t["finished_at"] = time.time()
+                    t["exit_code"] = -1
+
+            harness = session.get("harness", "amp")
+            log.info("session_resume_scheduled", thread=key, harness=harness, message_len=len(user_message))
+
+            def _resume(thread_key: str, msg: str, h: str) -> None:
+                try:
+                    result = self.execute(thread_key, msg, h)
+                    result_text = result.get("result", "")
+                    _post_to_slack_sync(thread_key, result_text)
+                    log.info("session_resumed_ok", thread=thread_key, result_len=len(result_text))
+                except Exception as exc:
+                    log.warning("session_resume_failed", thread=thread_key, error=str(exc))
+                    _post_to_slack_sync(thread_key, f"⚠️ Failed to resume interrupted job: {exc}")
+
+            threading.Thread(target=_resume, args=(key, user_message, harness), daemon=True).start()
+            resumed += 1
+
+        if resumed:
+            log.info("session_resume_dispatched", count=resumed)
+
+        return {"recovered": recovered, "pruned": pruned, "resumed": resumed}
 
     def interrupt(self, slack_thread_key: str) -> dict[str, Any]:
         """Interrupt the currently running command in a sandbox."""
