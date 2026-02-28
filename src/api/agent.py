@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import tarfile
 import threading
@@ -636,7 +637,10 @@ def _extract_result(
 
     # Fallback: if no structured output found, use last non-empty stderr
     if not result_text and stderr_lines:
-        tail = [line for line in stderr_lines[-10:] if line.strip()]
+        # Strip ANSI escape codes before surfacing stderr
+        ansi_re = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[=>]?[0-9]*[A-Za-z]?")
+        tail = [ansi_re.sub("", line).strip() for line in stderr_lines[-10:]]
+        tail = [line for line in tail if line]
         if tail:
             result_text = "❌ Agent produced no output. Stderr:\n" + "\n".join(tail)
 
@@ -969,6 +973,10 @@ class AgentClient:
             for stdout_chunk, stderr_chunk in output:
                 if _shutdown_event.is_set():
                     log.warning("agent_exec_shutdown", thread=slack_thread_key)
+                    # Clear thread ID so next execution starts fresh
+                    # instead of trying to continue a corrupted session
+                    with _sessions_lock:
+                        session["agent_thread_id"] = None
                     break
                 if time.monotonic() - started > EXEC_TIMEOUT:
                     timed_out = True
