@@ -612,6 +612,13 @@ class AgentClient:
         _emit = emit or (lambda _: None)
         rid = request_id or ""
         session = _sessions.get(slack_thread_key)
+        if session and session.get("harness") == "engineer":
+            return {
+                "error": (
+                    "Active engineer session in progress for this thread. "
+                    "Complete or stop it before running harness execution."
+                )
+            }
 
         # Auto-spawn if no session or container is gone
         if session:
