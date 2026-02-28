@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import tarfile
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -35,13 +36,45 @@ POOL_SIZE = int(os.getenv("AGENT_POOL_SIZE", "0"))
 
 # In-memory session registry: slack_thread_key → session dict
 _sessions: dict[str, dict[str, Any]] = {}
+_sessions_lock = threading.RLock()
+_execute_locks: dict[str, threading.Lock] = {}
+_execute_locks_guard = threading.Lock()
 
 _ACTIVE_SESSION_STATES = ("working", "idle", "running")
 
 
+def get_session_state(thread_key: str) -> dict[str, Any] | None:
+    with _sessions_lock:
+        return _sessions.get(thread_key)
+
+
+def set_session_state(thread_key: str, session: dict[str, Any]) -> None:
+    with _sessions_lock:
+        _sessions[thread_key] = session
+
+
+def pop_session_state(thread_key: str) -> dict[str, Any] | None:
+    with _sessions_lock:
+        return _sessions.pop(thread_key, None)
+
+
+def session_items_snapshot() -> list[tuple[str, dict[str, Any]]]:
+    with _sessions_lock:
+        return list(_sessions.items())
+
+
+def get_execute_lock(thread_key: str) -> threading.Lock:
+    with _execute_locks_guard:
+        lock = _execute_locks.get(thread_key)
+        if lock is None:
+            lock = threading.Lock()
+            _execute_locks[thread_key] = lock
+        return lock
+
+
 def has_active_non_engineer_session(thread_key: str) -> tuple[bool, str | None]:
     """Return (True, harness) if an active non-engineer session would be overwritten."""
-    session = _sessions.get(thread_key)
+    session = get_session_state(thread_key)
     if not session:
         return (False, None)
     harness = session.get("harness")
@@ -57,7 +90,7 @@ def has_active_non_engineer_session(thread_key: str) -> tuple[bool, str | None]:
 
 # Pool of pre-warmed, unclaimed containers (LIFO)
 _pool: list[str] = []  # container IDs
-_pool_lock = __import__("threading").Lock()
+_pool_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -507,7 +540,7 @@ class AgentClient:
             raise RuntimeError(f"Unknown harness: {harness}. Use one of {HARNESSES}")
 
         # Reuse existing container if alive
-        existing = _sessions.get(slack_thread_key)
+        existing = get_session_state(slack_thread_key)
         if existing:
             try:
                 client = _docker_client()
@@ -535,7 +568,7 @@ class AgentClient:
                     "harness": existing["harness"],
                 }
             except NotFound:
-                del _sessions[slack_thread_key]
+                pop_session_state(slack_thread_key)
 
         # Try to claim a pre-warmed container from the pool (skip if repo needed)
         container = None
@@ -575,7 +608,7 @@ class AgentClient:
             "last_activity": time.time(),
             "turns": [],
         }
-        _sessions[slack_thread_key] = session
+        set_session_state(slack_thread_key, session)
         _persist_session(session, slack_thread_key)
 
         log.info("spawn_done", request_id=rid, thread=slack_thread_key, status=status)
@@ -611,197 +644,216 @@ class AgentClient:
         """
         _emit = emit or (lambda _: None)
         rid = request_id or ""
-        session = _sessions.get(slack_thread_key)
-        if session and session.get("harness") == "engineer":
+        execute_lock = get_execute_lock(slack_thread_key)
+        if not execute_lock.acquire(blocking=False):
             return {
-                "error": (
-                    "Active engineer session in progress for this thread. "
-                    "Complete or stop it before running harness execution."
-                )
+                "error": "A run is already in progress for this thread. Wait for it to finish first."
             }
 
-        # Auto-spawn if no session or container is gone
-        if session:
-            client = _docker_client()
-            try:
-                container = client.containers.get(session["container_id"])
-            except NotFound:
-                del _sessions[slack_thread_key]
-                session = None
-
-        if not session:
-            log.info("exec_auto_spawn", request_id=rid, thread=slack_thread_key)
-            _emit({"type": "status", "stage": "container.creating"})
-            self.spawn(slack_thread_key, harness, repo, request_id)
-            _emit({"type": "status", "stage": "container.ready"})
-            session = _sessions[slack_thread_key]
-            client = _docker_client()
-            container = client.containers.get(session["container_id"])
-
-        # Download and copy files into the container
-        if files:
-            _emit({"type": "status", "stage": "files.downloading", "count": len(files)})
-            file_paths = _download_files_to_container(container, files)
-            if file_paths:
-                listing = "\n".join(f"- {p}" for p in file_paths)
-                message = (
-                    f"{message}\n\nAttached files (already downloaded to the container):\n{listing}"
-                )
-
-        cmd = _build_command(session["harness"], message, session["agent_thread_id"])
-
-        session["state"] = "working"
-        session["last_activity"] = time.time()
-        started_ts = time.time()
-        log.info(
-            "exec_start",
-            request_id=rid,
-            thread=slack_thread_key,
-            harness=session["harness"],
-        )
-
-        # Create the turn on the session immediately so SSE can stream it live
-        live_turn: dict[str, Any] = {
-            "turn_id": len(session.get("turns", [])) + 1,
-            "user_message": message,
-            "events": [],
-            "result": "",
-            "started_at": started_ts,
-            "finished_at": None,
-            "exit_code": None,
-            "timed_out": False,
-            "duration_s": 0,
-        }
-        session.setdefault("turns", []).append(live_turn)
-
-        # Use low-level exec API for streaming
-        api = client.api
-        exec_id = api.exec_create(
-            container.id,
-            cmd,
-            stdout=True,
-            stderr=True,
-        )["Id"]
-
-        _emit({"type": "status", "stage": "exec.start", "harness": session["harness"]})
-        output = api.exec_start(exec_id, stream=True, demux=True)
-
-        # Collect stdout and stderr separately
-        stdout_decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        stderr_decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        lines: list[str] = []
-        stderr_lines: list[str] = []
-        buf = ""
-        err_buf = ""
-        timed_out = False
-        first_output_logged = False
-        started = time.monotonic()
-
-        for stdout_chunk, stderr_chunk in output:
-            if time.monotonic() - started > EXEC_TIMEOUT:
-                timed_out = True
-                log.warning("agent_exec_timeout", thread=slack_thread_key, timeout=EXEC_TIMEOUT)
-                break
-            if stdout_chunk:
-                if not first_output_logged:
-                    first_output_logged = True
-                    log.info(
-                        "exec_first_output",
-                        request_id=rid,
-                        thread=slack_thread_key,
-                        elapsed_s=round(time.monotonic() - started, 3),
+        try:
+            session = get_session_state(slack_thread_key)
+            if session and session.get("harness") == "engineer":
+                return {
+                    "error": (
+                        "Active engineer session in progress for this thread. "
+                        "Complete or stop it before running harness execution."
                     )
-                buf += stdout_decoder.decode(stdout_chunk)
-                while "\n" in buf:
-                    idx = buf.index("\n")
-                    line = buf[:idx]
-                    lines.append(line)
-                    buf = buf[idx + 1 :]
-                    # Append event to live turn in real-time for SSE
-                    stripped = line.strip()
-                    if stripped:
-                        try:
-                            evt = json.loads(stripped)
-                            live_turn["events"].append(evt)
-                            _emit(evt)
-                        except json.JSONDecodeError:
-                            live_turn["events"].append({"type": "raw", "text": stripped})
-            if stderr_chunk:
-                err_buf += stderr_decoder.decode(stderr_chunk)
-                while "\n" in err_buf:
-                    idx = err_buf.index("\n")
-                    stderr_lines.append(err_buf[:idx])
-                    err_buf = err_buf[idx + 1 :]
+                }
+            if session and session.get("state") == "working":
+                return {
+                    "error": "A run is already in progress for this thread. Wait for it to finish first."
+                }
 
-        # Flush remaining buffers
-        if buf.strip():
-            lines.append(buf)
-            stripped = buf.strip()
-            try:
-                live_turn["events"].append(json.loads(stripped))
-            except json.JSONDecodeError:
-                live_turn["events"].append({"type": "raw", "text": stripped})
-        if err_buf.strip():
-            stderr_lines.append(err_buf)
+            # Auto-spawn if no session or container is gone
+            if session:
+                client = _docker_client()
+                try:
+                    container = client.containers.get(session["container_id"])
+                except NotFound:
+                    pop_session_state(slack_thread_key)
+                    session = None
 
-        # If timed out, kill the exec process
-        if timed_out:
-            with contextlib.suppress(Exception):
-                container.exec_run(["pkill", "-TERM", "-f", session["harness"]], detach=True)
+            if not session:
+                log.info("exec_auto_spawn", request_id=rid, thread=slack_thread_key)
+                _emit({"type": "status", "stage": "container.creating"})
+                self.spawn(slack_thread_key, harness, repo, request_id)
+                _emit({"type": "status", "stage": "container.ready"})
+                session = get_session_state(slack_thread_key)
+                if session is None:
+                    return {"error": "Failed to initialize agent session after spawn."}
+                client = _docker_client()
+                container = client.containers.get(session["container_id"])
 
-        # Check exec exit code
-        exit_code = api.exec_inspect(exec_id).get("ExitCode")
+            # Download and copy files into the container
+            if files:
+                _emit({"type": "status", "stage": "files.downloading", "count": len(files)})
+                file_paths = _download_files_to_container(container, files)
+                if file_paths:
+                    listing = "\n".join(f"- {p}" for p in file_paths)
+                    message = (
+                        f"{message}\n\nAttached files (already downloaded to the container):\n{listing}"
+                    )
 
-        result_text, agent_thread_id = _extract_result(lines, session["harness"], stderr_lines)
+            cmd = _build_command(session["harness"], message, session["agent_thread_id"])
 
-        if timed_out and not result_text:
-            result_text = f"❌ Agent timed out after {EXEC_TIMEOUT}s."
-        elif exit_code and exit_code != 0 and not result_text:
-            result_text = f"❌ Agent exited with code {exit_code}."
-            if stderr_lines:
-                tail = "\n".join(stderr_lines[-5:])
-                result_text += f"\n```\n{tail}\n```"
+            started_ts = time.time()
+            with _sessions_lock:
+                session["state"] = "working"
+                session["last_activity"] = started_ts
+            log.info(
+                "exec_start",
+                request_id=rid,
+                thread=slack_thread_key,
+                harness=session["harness"],
+            )
 
-        if agent_thread_id:
-            session["agent_thread_id"] = agent_thread_id
+            # Create the turn on the session immediately so SSE can stream it live
+            live_turn: dict[str, Any] = {
+                "turn_id": len(session.get("turns", [])) + 1,
+                "user_message": message,
+                "events": [],
+                "result": "",
+                "started_at": started_ts,
+                "finished_at": None,
+                "exit_code": None,
+                "timed_out": False,
+                "duration_s": 0,
+            }
+            with _sessions_lock:
+                session.setdefault("turns", []).append(live_turn)
 
-        # Finalize the live turn
-        live_turn["result"] = result_text
-        live_turn["finished_at"] = time.time()
-        live_turn["exit_code"] = exit_code
-        live_turn["timed_out"] = timed_out
-        live_turn["duration_s"] = round(time.time() - started_ts, 1)
+            # Use low-level exec API for streaming
+            api = client.api
+            exec_id = api.exec_create(
+                container.id,
+                cmd,
+                stdout=True,
+                stderr=True,
+            )["Id"]
 
-        # Persist to PG in background
-        _persist_turn(slack_thread_key, live_turn)
+            _emit({"type": "status", "stage": "exec.start", "harness": session["harness"]})
+            output = api.exec_start(exec_id, stream=True, demux=True)
 
-        session["state"] = "idle"
-        session["last_activity"] = time.time()
-        _persist_session(session, slack_thread_key)
-        log.info(
-            "exec_done",
-            request_id=rid,
-            thread=slack_thread_key,
-            harness=session["harness"],
-            exit_code=exit_code,
-            timed_out=timed_out,
-            duration_s=live_turn["duration_s"],
-            result_len=len(result_text),
-        )
+            # Collect stdout and stderr separately
+            stdout_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            stderr_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            lines: list[str] = []
+            stderr_lines: list[str] = []
+            buf = ""
+            err_buf = ""
+            timed_out = False
+            first_output_logged = False
+            started = time.monotonic()
 
-        result = {
-            "session_id": slack_thread_key,
-            "result": result_text,
-            "agent_thread_id": session["agent_thread_id"],
-            "harness": session["harness"],
-        }
-        _emit({"type": "final", **result})
-        return result
+            for stdout_chunk, stderr_chunk in output:
+                if time.monotonic() - started > EXEC_TIMEOUT:
+                    timed_out = True
+                    log.warning("agent_exec_timeout", thread=slack_thread_key, timeout=EXEC_TIMEOUT)
+                    break
+                if stdout_chunk:
+                    if not first_output_logged:
+                        first_output_logged = True
+                        log.info(
+                            "exec_first_output",
+                            request_id=rid,
+                            thread=slack_thread_key,
+                            elapsed_s=round(time.monotonic() - started, 3),
+                        )
+                    buf += stdout_decoder.decode(stdout_chunk)
+                    while "\n" in buf:
+                        idx = buf.index("\n")
+                        line = buf[:idx]
+                        lines.append(line)
+                        buf = buf[idx + 1 :]
+                        # Append event to live turn in real-time for SSE
+                        stripped = line.strip()
+                        if stripped:
+                            try:
+                                evt = json.loads(stripped)
+                                live_turn["events"].append(evt)
+                                _emit(evt)
+                            except json.JSONDecodeError:
+                                live_turn["events"].append({"type": "raw", "text": stripped})
+                if stderr_chunk:
+                    err_buf += stderr_decoder.decode(stderr_chunk)
+                    while "\n" in err_buf:
+                        idx = err_buf.index("\n")
+                        stderr_lines.append(err_buf[:idx])
+                        err_buf = err_buf[idx + 1 :]
+
+            # Flush remaining buffers
+            if buf.strip():
+                lines.append(buf)
+                stripped = buf.strip()
+                try:
+                    live_turn["events"].append(json.loads(stripped))
+                except json.JSONDecodeError:
+                    live_turn["events"].append({"type": "raw", "text": stripped})
+            if err_buf.strip():
+                stderr_lines.append(err_buf)
+
+            # If timed out, kill the exec process
+            if timed_out:
+                with contextlib.suppress(Exception):
+                    container.exec_run(["pkill", "-TERM", "-f", session["harness"]], detach=True)
+
+            # Check exec exit code
+            exit_code = api.exec_inspect(exec_id).get("ExitCode")
+
+            result_text, agent_thread_id = _extract_result(lines, session["harness"], stderr_lines)
+
+            if timed_out and not result_text:
+                result_text = f"❌ Agent timed out after {EXEC_TIMEOUT}s."
+            elif exit_code and exit_code != 0 and not result_text:
+                result_text = f"❌ Agent exited with code {exit_code}."
+                if stderr_lines:
+                    tail = "\n".join(stderr_lines[-5:])
+                    result_text += f"\n```\n{tail}\n```"
+
+            if agent_thread_id:
+                with _sessions_lock:
+                    session["agent_thread_id"] = agent_thread_id
+
+            # Finalize the live turn
+            live_turn["result"] = result_text
+            live_turn["finished_at"] = time.time()
+            live_turn["exit_code"] = exit_code
+            live_turn["timed_out"] = timed_out
+            live_turn["duration_s"] = round(time.time() - started_ts, 1)
+
+            # Persist to PG in background
+            _persist_turn(slack_thread_key, live_turn)
+
+            with _sessions_lock:
+                session["state"] = "idle"
+                session["last_activity"] = time.time()
+            _persist_session(session, slack_thread_key)
+            log.info(
+                "exec_done",
+                request_id=rid,
+                thread=slack_thread_key,
+                harness=session["harness"],
+                exit_code=exit_code,
+                timed_out=timed_out,
+                duration_s=live_turn["duration_s"],
+                result_len=len(result_text),
+            )
+
+            result = {
+                "session_id": slack_thread_key,
+                "result": result_text,
+                "agent_thread_id": session["agent_thread_id"],
+                "harness": session["harness"],
+            }
+            _emit({"type": "final", **result})
+            return result
+        finally:
+            execute_lock.release()
 
     def status(self, slack_thread_key: str | None = None) -> dict[str, Any]:
         """Get session status. If no key given, list all sessions."""
         if slack_thread_key:
-            session = _sessions.get(slack_thread_key)
+            session = get_session_state(slack_thread_key)
             if not session:
                 return {"error": f"No session for '{slack_thread_key}'"}
             return {
@@ -809,14 +861,15 @@ class AgentClient:
                 **session,
             }
 
+        sessions = session_items_snapshot()
         return {
-            "sessions": [{"session_id": k, **v} for k, v in _sessions.items()],
-            "count": len(_sessions),
+            "sessions": [{"session_id": k, **v} for k, v in sessions],
+            "count": len(sessions),
         }
 
     def stop(self, slack_thread_key: str) -> dict[str, Any]:
         """Stop and remove a sandbox container."""
-        session = _sessions.get(slack_thread_key)
+        session = get_session_state(slack_thread_key)
         if not session:
             return {"error": f"No session for '{slack_thread_key}'"}
 
@@ -839,14 +892,14 @@ class AgentClient:
         except Exception:
             pass
 
-        del _sessions[slack_thread_key]
+        pop_session_state(slack_thread_key)
         _delete_session(slack_thread_key)
         return {"session_id": slack_thread_key, "status": "stopped"}
 
     def threads(self) -> dict[str, Any]:
         """List all agent threads with summary info for the thread viewer."""
         result = []
-        for key, session in _sessions.items():
+        for key, session in session_items_snapshot():
             turns = session.get("turns", [])
             result.append(
                 {
@@ -865,7 +918,7 @@ class AgentClient:
 
     def thread_detail(self, slack_thread_key: str) -> dict[str, Any]:
         """Get full event stream for a specific thread including all turns and tool calls."""
-        session = _sessions.get(slack_thread_key)
+        session = get_session_state(slack_thread_key)
         if not session:
             return {"error": f"No session for '{slack_thread_key}'"}
         return {
@@ -894,7 +947,7 @@ class AgentClient:
 
         for row in rows:
             key = row["slack_thread_key"]
-            if key in _sessions:
+            if get_session_state(key):
                 continue
 
             harness = row.get("harness", "amp")
@@ -948,7 +1001,7 @@ class AgentClient:
 
             created = row.get("created_at")
             last_act = row.get("last_activity")
-            _sessions[key] = {
+            recovered_session = {
                 "container_id": container_id,
                 "harness": row.get("harness", "amp"),
                 "agent_thread_id": row.get("agent_thread_id"),
@@ -957,6 +1010,7 @@ class AgentClient:
                 "last_activity": last_act.timestamp() if last_act else time.time(),
                 "turns": turns,
             }
+            set_session_state(key, recovered_session)
             recovered += 1
             log.info("session_recovered", thread=key, turns=len(turns))
 
@@ -965,8 +1019,8 @@ class AgentClient:
             containers = client.containers.list(filters={"label": "agent2=true"})
             for container in containers:
                 key = container.labels.get("ai2.thread", "")
-                if key and key not in _sessions:
-                    _sessions[key] = {
+                if key and not get_session_state(key):
+                    recovered_session = {
                         "container_id": container.id,
                         "harness": container.labels.get("ai2.harness", "amp"),
                         "agent_thread_id": None,
@@ -975,7 +1029,8 @@ class AgentClient:
                         "last_activity": time.time(),
                         "turns": [],
                     }
-                    _persist_session(_sessions[key], key)
+                    set_session_state(key, recovered_session)
+                    _persist_session(recovered_session, key)
                     recovered += 1
                     log.info("session_recovered_from_docker", thread=key)
         except Exception:
@@ -986,7 +1041,7 @@ class AgentClient:
 
     def interrupt(self, slack_thread_key: str) -> dict[str, Any]:
         """Interrupt the currently running command in a sandbox."""
-        session = _sessions.get(slack_thread_key)
+        session = get_session_state(slack_thread_key)
         if not session:
             return {"error": f"No session for '{slack_thread_key}'"}
 
