@@ -32,8 +32,9 @@ log = structlog.get_logger()
 
 HARNESSES = ("amp", "claude-code", "codex", "pi-mono")
 
-# Max seconds to wait for a single exec call before killing it
-EXEC_TIMEOUT = int(os.getenv("AGENT_EXEC_TIMEOUT", "600"))
+# Max seconds of *idle* time (no output) before killing a hung exec.
+# Active agents that keep producing output are never killed by this timeout.
+EXEC_IDLE_TIMEOUT = int(os.getenv("AGENT_EXEC_IDLE_TIMEOUT", "600"))
 
 # Number of pre-warmed containers to keep ready
 POOL_SIZE = int(os.getenv("AGENT_POOL_SIZE", "0"))
@@ -969,6 +970,7 @@ class AgentClient:
             timed_out = False
             first_output_logged = False
             started = time.monotonic()
+            last_output_at = started
 
             for stdout_chunk, stderr_chunk in output:
                 if _shutdown_event.is_set():
@@ -978,10 +980,17 @@ class AgentClient:
                     with _sessions_lock:
                         session["agent_thread_id"] = None
                     break
-                if time.monotonic() - started > EXEC_TIMEOUT:
+                if time.monotonic() - last_output_at > EXEC_IDLE_TIMEOUT:
                     timed_out = True
-                    log.warning("agent_exec_timeout", thread=slack_thread_key, timeout=EXEC_TIMEOUT)
+                    log.warning(
+                        "agent_exec_idle_timeout",
+                        thread=slack_thread_key,
+                        idle_timeout=EXEC_IDLE_TIMEOUT,
+                        total_elapsed=round(time.monotonic() - started, 1),
+                    )
                     break
+                if stdout_chunk or stderr_chunk:
+                    last_output_at = time.monotonic()
                 if stdout_chunk:
                     if not first_output_logged:
                         first_output_logged = True
@@ -1053,7 +1062,11 @@ class AgentClient:
             result_text, agent_thread_id = _extract_result(lines, session["harness"], stderr_lines)
 
             if timed_out and not result_text:
-                result_text = f"❌ Agent timed out after {EXEC_TIMEOUT}s."
+                elapsed_total = round(time.monotonic() - started)
+                result_text = (
+                    f"❌ Agent appears hung — no output for {EXEC_IDLE_TIMEOUT}s"
+                    f" (ran for {elapsed_total}s total)."
+                )
             elif exit_code and exit_code != 0 and not result_text:
                 result_text = f"❌ Agent exited with code {exit_code}."
                 if stderr_lines:
