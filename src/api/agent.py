@@ -655,21 +655,58 @@ def _persist_session(session: dict[str, Any], key: str) -> None:
     )
 
 
+def _extract_artifacts(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract file artifacts (uploads, screenshots) from turn events."""
+    artifacts = []
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        content = evt.get("content") if evt.get("type") == "tool" else None
+        if not content:
+            continue
+        text = ""
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text += block.get("text", "")
+        elif isinstance(content, str):
+            text = content
+        if not text:
+            continue
+        try:
+            data = json.loads(text) if text.strip().startswith("{") else {}
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+        if data.get("permalink") or data.get("url"):
+            artifacts.append({
+                "type": "file",
+                "filename": data.get("name", data.get("filename", "")),
+                "permalink": data.get("permalink", ""),
+                "url": data.get("url", ""),
+                "id": data.get("id", ""),
+                "timestamp": evt.get("received_at", ""),
+            })
+    return artifacts
+
+
 def _persist_turn(key: str, turn: dict[str, Any]) -> None:
     events_json = json.dumps(turn.get("events", []), default=str)
+    artifacts = _extract_artifacts(turn.get("events", []))
+    artifacts_json = json.dumps(artifacts, default=str)
     _pg_write(
         """
         INSERT INTO agent_turns
             (slack_thread_key, turn_id, user_message, events, result,
-             started_at, finished_at, exit_code, timed_out, duration_s)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             started_at, finished_at, exit_code, timed_out, duration_s, artifacts)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (slack_thread_key, turn_id) DO UPDATE SET
             events      = EXCLUDED.events,
             result      = EXCLUDED.result,
             finished_at = EXCLUDED.finished_at,
             exit_code   = EXCLUDED.exit_code,
             timed_out   = EXCLUDED.timed_out,
-            duration_s  = EXCLUDED.duration_s
+            duration_s  = EXCLUDED.duration_s,
+            artifacts   = EXCLUDED.artifacts
         """,
         (
             key,
@@ -682,6 +719,7 @@ def _persist_turn(key: str, turn: dict[str, Any]) -> None:
             turn.get("exit_code"),
             turn.get("timed_out", False),
             turn.get("duration_s", 0),
+            artifacts_json,
         ),
     )
 
