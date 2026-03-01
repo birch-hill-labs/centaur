@@ -881,14 +881,25 @@ def _refill_pool() -> None:
     _threading.Thread(target=_fill, daemon=True).start()
 
 
+def _fetch_placeholders() -> dict[str, str]:
+    """Fetch placeholder mappings from the secrets service."""
+    url = os.getenv("SECRET_MANAGER_URL", "http://secrets:8100")
+    try:
+        resp = httpx.get(f"{url}/placeholders", timeout=5.0)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        log.warning("placeholder_fetch_failed", error=str(exc))
+        return {}
+
+
 def _container_env() -> list[str]:
     """Build env vars to forward into the container.
 
     When MITM_HOST is set, secrets are NOT passed to sandboxes.  Instead,
-    placeholder values are injected and the MITM proxy handles credential
-    injection at the HTTP layer.  This means a compromised sandbox cannot
-    exfiltrate real API keys — they only exist in the secrets service and
-    transiently in the MITM proxy's memory.
+    placeholder tokens (fetched from the secrets service) are injected and
+    the MITM proxy replaces them with real values in-flight.  Secrets never
+    exist inside sandbox containers.
     """
     env = [
         f"AI_V2_API_URL={os.getenv('AGENT_API_URL', 'http://api:8000')}",
@@ -897,16 +908,18 @@ def _container_env() -> list[str]:
 
     mitm_host = os.getenv("MITM_HOST", "")
     if mitm_host:
-        # MITM proxy mode: placeholder keys + proxy config.
-        # Real credentials are injected by the proxy addon.
-        _ph = "PROXY" + "_" + "MANAGED"
-        for _k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY",
-                    "AMP_API_KEY", "GITHUB_TOKEN"):
-            env.append(f"{_k}={_ph}")
+        # Fetch real placeholder tokens from the secrets service.
+        placeholders = _fetch_placeholders()
+        for name, placeholder in placeholders.items():
+            env.append(f"{name}={placeholder}")
+
         env.extend([
             f"HTTPS_PROXY=http://{mitm_host}:8080",
             f"HTTP_PROXY=http://{mitm_host}:8080",
+            f"https_proxy=http://{mitm_host}:8080",
+            f"http_proxy=http://{mitm_host}:8080",
             "NO_PROXY=api,localhost,127.0.0.1",
+            "no_proxy=api,localhost,127.0.0.1",
             "NODE_EXTRA_CA_CERTS=/mitm-certs/ca-cert.pem",
             "REQUESTS_CA_BUNDLE=/mitm-certs/ca-cert.pem",
             "SSL_CERT_FILE=/mitm-certs/ca-cert.pem",
@@ -914,19 +927,21 @@ def _container_env() -> list[str]:
         ])
     else:
         # Legacy mode: pass secrets directly as env vars.
-        keys = [
-            "AMP_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "OPENAI_API_KEY",
-            "GITHUB_TOKEN",
-        ]
-        for k in keys:
+        for k in ("AMP_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN"):
             v = os.getenv(k, "")
             if v:
                 env.append(f"{k}={v}")
         openai_key = os.getenv("OPENAI_API_KEY", "")
         if openai_key and not os.getenv("CODEX_API_KEY"):
             env.append(f"CODEX_API_KEY={openai_key}")
+
+    # Codex falls back to OPENAI_API_KEY internally but setting explicitly
+    # avoids issues with some versions.
+    openai_val = next(
+        (e.split("=", 1)[1] for e in env if e.startswith("OPENAI_API_KEY=")), ""
+    )
+    if openai_val and not any(e.startswith("CODEX_API_KEY=") for e in env):
+        env.append(f"CODEX_API_KEY={openai_val}")
 
     return env
 
