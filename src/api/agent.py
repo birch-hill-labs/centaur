@@ -894,25 +894,56 @@ def _refill_pool() -> None:
     _threading.Thread(target=_fill, daemon=True).start()
 
 
+def _sm_list_keys() -> list[str]:
+    """Fetch all available secret key names from the secret manager."""
+    url = os.environ.get("SECRET_MANAGER_URL", "http://secrets:8100")
+    try:
+        resp = httpx.get(f"{url}/keys", timeout=5.0)
+        if resp.status_code == 200:
+            return resp.json().get("keys", [])
+    except Exception:
+        log.warning("failed to fetch secret keys from secret manager")
+    return []
+
+
+# Env var name → secret manager key name, for cases where they differ.
+_SECRET_OVERRIDES: dict[str, str] = {}
+
+
 def _container_env() -> list[str]:
     """Build env vars for sandbox containers.
 
     Containers never receive real API keys.  The firewall proxy
-    unconditionally injects credentials into HTTP headers based on
-    the target host.  Stub env vars are still needed so harness CLIs
-    use API-key auth flows instead of interactive/browser login.
+    intercepts outgoing HTTPS and replaces key-name placeholders in
+    header values with real secrets.  We set every known secret as
+    ``KEY=KEY`` (the key name *is* the placeholder value) so harness
+    CLIs use API-key auth flows instead of interactive/browser login.
+
+    Use ``_SECRET_OVERRIDES`` to remap an env var to a different secret
+    manager key (e.g. ``GITHUB_TOKEN`` → ``SVC_PARADIGM_GITHUB_TOKEN``).
     """
     firewall_host = os.getenv("FIREWALL_HOST", "firewall")
 
-    return [
+    env = [
         f"AI_V2_API_URL={os.getenv('AGENT_API_URL', 'http://api:8000')}",
         f"AI_V2_API_KEY={_fetch_secret('API_SECRET_KEY')}",
-        # Values are set to the secret key name itself. The firewall scans
-        # header values for known key names and replaces them with real secrets.
-        "ANTHROPIC_API_KEY=ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY=OPENAI_API_KEY",
-        "AMP_API_KEY=AMP_API_KEY",
-        "GITHUB_TOKEN=GITHUB_TOKEN",
+    ]
+
+    # Pull in every secret from the secret manager as KEY=KEY placeholders.
+    seen: set[str] = set()
+    for key in _sm_list_keys():
+        env_name = key
+        env_value = _SECRET_OVERRIDES.get(key, key)
+        env.append(f"{env_name}={env_value}")
+        seen.add(env_name)
+
+    # Apply overrides for env var names that don't exist as secret keys
+    # (i.e. the override target is a different key name).
+    for env_name, secret_key in _SECRET_OVERRIDES.items():
+        if env_name not in seen:
+            env.append(f"{env_name}={secret_key}")
+
+    env.extend([
         f"HTTPS_PROXY=http://{firewall_host}:8080",
         f"HTTP_PROXY=http://{firewall_host}:8080",
         f"https_proxy=http://{firewall_host}:8080",
@@ -923,7 +954,9 @@ def _container_env() -> list[str]:
         "REQUESTS_CA_BUNDLE=/firewall-certs/ca-cert.pem",
         "SSL_CERT_FILE=/firewall-certs/ca-cert.pem",
         "GIT_SSL_CAINFO=/firewall-certs/ca-cert.pem",
-    ]
+    ])
+
+    return env
 
 
 def _build_command(harness: str, message: str, thread_id: str | None) -> list[str]:
