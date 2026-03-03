@@ -596,12 +596,77 @@ def _display_user_message(message: str) -> str:
     return text
 
 
+def _persist_kickoff_error_turn(
+    slack_thread_key: str,
+    user_message: str,
+    error_message: str,
+    *,
+    source_tag: str,
+    user_id: str | None,
+) -> None:
+    found = _find_session_for_thread(slack_thread_key)
+    if not found:
+        return
+    canonical_key, session = found
+    now = time.time()
+    with _sessions_lock:
+        turns = session.setdefault("turns", [])
+        turn_id = len(turns) + 1
+        seq_floor = _event_seq_floor_for_session(session, canonical_key)
+        session["next_event_seq"] = max(int(session.get("next_event_seq") or 1), seq_floor)
+        turn = {
+            "turn_id": turn_id,
+            "user_message": user_message,
+            "events": [],
+            "result": f"❌ {error_message}",
+            "user_id": user_id,
+            "started_at": now,
+            "finished_at": now,
+            "exit_code": -1,
+            "timed_out": False,
+            "duration_s": 0,
+        }
+        _append_session_event(
+            session,
+            turn["events"],
+            {
+                "type": "thread.message",
+                "message_type": "command",
+                "source": source_tag or "api",
+                "text": user_message,
+                "created_at": datetime.now(UTC).isoformat(),
+                **({"user_id": user_id} if user_id else {}),
+            },
+        )
+        _append_session_event(
+            session,
+            turn["events"],
+            {
+                "type": "error",
+                "message": error_message,
+                "received_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        turns.append(turn)
+        session["state"] = "error"
+        session["last_activity"] = now
+    _persist_session(session, canonical_key)
+    _persist_turn(canonical_key, turn)
+
+
 def _find_session_for_thread(thread_key: str) -> tuple[str, dict[str, Any]] | None:
     for candidate in _thread_key_aliases(thread_key):
         session = get_session_state(candidate)
         if session:
             return candidate, session
     return None
+
+
+def _resolve_existing_thread_key(thread_key: str) -> str:
+    found = _find_session_for_thread(thread_key)
+    if found:
+        return found[0]
+    return thread_key.strip()
 
 
 def _context_line(source: str | None, user_id: str | None, text: str) -> str:
@@ -1718,6 +1783,7 @@ class AgentClient:
         and returns the final result text. If *emit* is provided, progress
         events are streamed to the caller in real-time.
         """
+        slack_thread_key = _resolve_existing_thread_key(slack_thread_key)
         _emit = emit or (lambda _: None)
         rid = request_id or ""
         source_tag = str(source or "api").strip().lower()
@@ -2206,6 +2272,85 @@ class AgentClient:
             if slot_acquired:
                 _release_execution_slot(actor_key)
             execute_lock.release()
+
+    def execute_kickoff(
+        self,
+        slack_thread_key: str,
+        message: str,
+        harness: str | None = None,
+        source: str | None = None,
+        repo: str | None = None,
+        request_id: str | None = None,
+        files: list[dict[str, str]] | None = None,
+        user_id: str | None = None,
+        model: str | None = None,
+        engine: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_thread_key = _resolve_existing_thread_key(slack_thread_key)
+        display_message = _display_user_message(message) or message.strip()
+        if not display_message:
+            return {"error": "Message is required"}
+
+        session = get_session_state(resolved_thread_key)
+        requested_harness = (harness or "").strip() or (
+            str(session.get("harness") or "amp") if session else "amp"
+        )
+        try:
+            _resolve_run_profile(requested_harness, engine=engine, repo=repo)
+        except RuntimeError as exc:
+            return {"error": str(exc)}
+
+        execute_lock = get_execute_lock(resolved_thread_key)
+        if not execute_lock.acquire(blocking=False):
+            return {
+                "status": "busy",
+                "error": "A run is already in progress for this thread. Wait for it to finish first.",
+            }
+        execute_lock.release()
+
+        def run_execute() -> None:
+            try:
+                result = self.execute(
+                    resolved_thread_key,
+                    message,
+                    harness,
+                    source,
+                    repo,
+                    request_id,
+                    files,
+                    None,
+                    user_id,
+                    model,
+                    engine,
+                )
+                kickoff_error = str(result.get("error") or "").strip()
+                if kickoff_error:
+                    log.warning(
+                        "exec_kickoff_execute_returned_error",
+                        thread=resolved_thread_key,
+                        request_id=request_id or "",
+                        error=kickoff_error,
+                    )
+                    _persist_kickoff_error_turn(
+                        resolved_thread_key,
+                        display_message,
+                        kickoff_error,
+                        source_tag=str(source or "api").strip().lower(),
+                        user_id=user_id,
+                    )
+            except Exception:
+                log.exception(
+                    "exec_kickoff_failed",
+                    thread=resolved_thread_key,
+                    request_id=request_id or "",
+                )
+
+        threading.Thread(target=run_execute, daemon=True).start()
+        return {
+            "status": "accepted",
+            "session_id": resolved_thread_key,
+            "request_id": request_id,
+        }
 
     def status(self, slack_thread_key: str | None = None) -> dict[str, Any]:
         """Get session status. If no key given, list all sessions."""
