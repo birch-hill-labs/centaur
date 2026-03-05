@@ -125,9 +125,7 @@ EXEC_IDLE_TIMEOUT = int(os.getenv("AGENT_EXEC_IDLE_TIMEOUT", "600"))
 POOL_SIZE = int(os.getenv("AGENT_POOL_SIZE", "0"))
 
 _SLACK_POST_TIMEOUT_S = 20.0
-_MAX_SLACK_MESSAGE_CHARS = 3800
-_SLACK_TRUNCATED_SUFFIX = "\n\n... (truncated)"
-_SLACK_POST_RETRY_ATTEMPTS = 3
+_SLACKBOT_URL = os.getenv("SLACKBOT_URL", "http://slackbot:3001")
 _THREAD_NAME_MAX_CHARS = 60
 _THREAD_CONTEXT_DELIMITER = "---"
 _MAX_PENDING_CONTEXT_MESSAGES = 18
@@ -504,24 +502,6 @@ def _slack_thread_parts(thread_key: str) -> tuple[str, str] | None:
     return channel, thread_ts
 
 
-def _truncate_slack_message(text: str) -> str:
-    safe_text = text.strip()
-    if not safe_text:
-        return ""
-    if len(safe_text) <= _MAX_SLACK_MESSAGE_CHARS:
-        return safe_text
-    budget = _MAX_SLACK_MESSAGE_CHARS - len(_SLACK_TRUNCATED_SUFFIX)
-    if budget <= 0:
-        return _SLACK_TRUNCATED_SUFFIX[:_MAX_SLACK_MESSAGE_CHARS]
-    return safe_text[:budget].rstrip() + _SLACK_TRUNCATED_SUFFIX
-
-
-_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_MD_HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
-_MD_BOLD_STAR_RE = re.compile(r"\*\*(.+?)\*\*")
-_MD_BOLD_UNDER_RE = re.compile(r"__(.+?)__")
-_MD_STRIKE_RE = re.compile(r"~~(.+?)~~")
-
 _DASHBOARD_BLOCK_RE = re.compile(r"```dashboard\n([\s\S]*?)```")
 
 _CURRENCY_FMT_THRESHOLDS = [
@@ -742,16 +722,6 @@ def _dashboards_to_slack(text: str) -> str:
     return "".join(result)
 
 
-def _markdown_to_slack(text: str) -> str:
-    """Convert standard Markdown formatting to Slack mrkdwn."""
-    out = _MD_LINK_RE.sub(r"<\2|\1>", text)
-    out = _MD_HEADING_RE.sub(r"*\1*", out)
-    out = _MD_BOLD_STAR_RE.sub(r"*\1*", out)
-    out = _MD_BOLD_UNDER_RE.sub(r"*\1*", out)
-    out = _MD_STRIKE_RE.sub(r"~\1~", out)
-    return out
-
-
 def _thread_name_from_user_message(raw_message: str) -> str | None:
     text = str(raw_message or "").strip()
     if not text:
@@ -772,15 +742,6 @@ def _thread_name_from_user_message(raw_message: str) -> str | None:
     return first_line[:_THREAD_NAME_MAX_CHARS].rstrip() or None
 
 
-def _slack_retry_after_s(response: httpx.Response) -> float:
-    retry_after = response.headers.get("Retry-After", "").strip()
-    try:
-        parsed = float(retry_after)
-    except ValueError:
-        return 1.0
-    return max(1.0, min(parsed, 30.0))
-
-
 def _post_to_slack(
     thread_key: str,
     text: str,
@@ -788,63 +749,48 @@ def _post_to_slack(
     event_prefix: str,
     warn_on_error: bool,
 ) -> None:
-    token = _fetch_secret("SLACK_BOT_TOKEN").strip()
+    token = _fetch_secret("API_SECRET_KEY").strip()
     if not token:
         return
     parts = _slack_thread_parts(thread_key)
     if parts is None:
         return
     channel, thread_ts = parts
-    safe_text = _truncate_slack_message(_markdown_to_slack(_dashboards_to_slack(text)))
-    if not safe_text:
+    markdown = _dashboards_to_slack(text).strip()
+    if not markdown:
         return
     logger = log.warning if warn_on_error else log.debug
     try:
-        with httpx.Client(timeout=_SLACK_POST_TIMEOUT_S) as client:
-            for attempt in range(_SLACK_POST_RETRY_ATTEMPTS):
-                resp = client.post(
-                    "https://slack.com/api/chat.postMessage",
-                    headers={"Authorization": f"Bearer {token}"},
-                    json={"channel": channel, "thread_ts": thread_ts, "text": safe_text},
-                )
-
-                if resp.status_code == 429 and attempt + 1 < _SLACK_POST_RETRY_ATTEMPTS:
-                    time.sleep(_slack_retry_after_s(resp))
-                    continue
-
-                if resp.status_code >= 300:
-                    logger(
-                        f"{event_prefix}_failed",
-                        thread=thread_key,
-                        status=resp.status_code,
-                        body=resp.text[:200],
-                    )
-                    return
-
-                try:
-                    data = resp.json()
-                except Exception:
-                    logger(
-                        f"{event_prefix}_invalid_json",
-                        thread=thread_key,
-                        body=resp.text[:200],
-                    )
-                    return
-
-                if data.get("ok"):
-                    return
-
-                error = str(data.get("error") or "unknown_error")
-                if error == "ratelimited" and attempt + 1 < _SLACK_POST_RETRY_ATTEMPTS:
-                    time.sleep(_slack_retry_after_s(resp))
-                    continue
-
-                logger(
-                    f"{event_prefix}_rejected",
-                    thread=thread_key,
-                    error=error,
-                )
-                return
+        resp = httpx.post(
+            f"{_SLACKBOT_URL}/api/internal/post-reply",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"channel": channel, "thread_ts": thread_ts, "markdown": markdown},
+            timeout=_SLACK_POST_TIMEOUT_S,
+        )
+        if resp.status_code >= 300:
+            logger(
+                f"{event_prefix}_failed",
+                thread=thread_key,
+                status=resp.status_code,
+                body=resp.text[:200],
+            )
+            return
+        try:
+            data = resp.json()
+        except Exception:
+            logger(
+                f"{event_prefix}_invalid_json",
+                thread=thread_key,
+                body=resp.text[:200],
+            )
+            return
+        if data.get("ok"):
+            return
+        logger(
+            f"{event_prefix}_rejected",
+            thread=thread_key,
+            error=str(data.get("error") or "unknown_error"),
+        )
     except Exception as exc:
         logger(f"{event_prefix}_exception", thread=thread_key, error=str(exc))
 
