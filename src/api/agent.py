@@ -11,12 +11,12 @@ import contextlib
 import json
 import queue
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import structlog
 
-from api.sandbox.base import SandboxSession
+from api.sandbox.base import SandboxBackend, SandboxSession
 from api.sandbox.registry import get_backend
 
 log = structlog.get_logger()
@@ -24,6 +24,33 @@ log = structlog.get_logger()
 
 # In-memory sessions — reconstructable from backend on restart
 _sessions: dict[str, SandboxSession] = {}
+
+
+def _init_session_metadata(session: SandboxSession) -> None:
+    """Initialize orchestration metadata on a session."""
+    session.metadata["turn_counter"] = 0
+    session.metadata["_active_turn_id"] = 0
+    session.metadata["_turn_lock"] = threading.Lock()
+    session.metadata["_active_queue"] = None
+
+
+def _get_override_backend(name: str) -> SandboxBackend:
+    if name == "docker":
+        from api.sandbox.docker import DockerSandboxBackend
+
+        return DockerSandboxBackend()
+    if name == "iron":
+        from api.sandbox.iron import IronSandboxBackend
+
+        return IronSandboxBackend()
+    raise ValueError(f"Unknown backend: {name}")
+
+
+def _backend_for(session: SandboxSession) -> SandboxBackend:
+    default = get_backend()
+    if session.backend_name and session.backend_name != default.name:
+        return _get_override_backend(session.backend_name)
+    return default
 
 
 def _ensure_reader(session: SandboxSession, *, force: bool = False) -> None:
@@ -37,7 +64,7 @@ def _ensure_reader(session: SandboxSession, *, force: bool = False) -> None:
     if not force and reader and reader.is_alive():
         return
 
-    backend = get_backend()
+    backend = _backend_for(session)
     gen = session.metadata.get("_reader_gen", 0) + 1
     session.metadata["_reader_gen"] = gen
 
@@ -62,19 +89,19 @@ def _ensure_reader(session: SandboxSession, *, force: bool = False) -> None:
     session.metadata["_reader_thread"] = t
 
 
-def _spawn_sync(thread_key: str, harness: str) -> SandboxSession:
+def _spawn_sync(
+    thread_key: str,
+    harness: str,
+    *,
+    backend_override: str | None = None,
+) -> SandboxSession:
     """Synchronous spawn: create sandbox + register session."""
-    engines = {"amp": "amp", "claude-code": "claude-code", "codex": "codex"}
-    engine = engines.get(harness, "amp")
+    engine = harness if harness in {"amp", "claude-code", "codex"} else "amp"
 
-    backend = get_backend()
+    backend = _get_override_backend(backend_override) if backend_override else get_backend()
     session = backend.create(thread_key, harness, engine)
 
-    # Initialize orchestration metadata
-    session.metadata["turn_counter"] = 0
-    session.metadata["_active_turn_id"] = 0
-    session.metadata["_turn_lock"] = threading.Lock()
-    session.metadata["_active_queue"] = None
+    _init_session_metadata(session)
 
     _sessions[thread_key] = session
     log.info("pipe_session_spawned", thread_key=thread_key, sandbox=session.sandbox_id[:12])
@@ -88,7 +115,7 @@ def _send_turn_and_stream(session: SandboxSession, message: str):
     queue. When a new turn starts, the old queue gets a None sentinel so the old
     consumer stops, and the new turn's queue takes over.
     """
-    backend = get_backend()
+    backend = _backend_for(session)
     backend.attach(session)
 
     # Create a new queue for this turn and swap it in atomically
@@ -150,7 +177,7 @@ def _stop_sync(thread_key: str) -> bool:
         q.put(None)
     session.metadata["_active_queue"] = None
 
-    backend = get_backend()
+    backend = _backend_for(session)
     backend.stop(session)
     log.info("pipe_session_stopped", thread_key=thread_key)
     return True
@@ -161,7 +188,7 @@ def _get_status_sync(thread_key: str) -> dict[str, Any]:
     session = _sessions.get(thread_key)
     if not session:
         return {"thread_key": thread_key, "status": "not_found"}
-    backend = get_backend()
+    backend = _backend_for(session)
     st = backend.status(session)
     if st == "gone":
         _sessions.pop(thread_key, None)
@@ -189,11 +216,7 @@ def _recover_sync() -> dict[str, Any]:
     for session in sessions:
         if not session.thread_key or session.thread_key in _sessions:
             continue
-        # Initialize orchestration metadata
-        session.metadata["turn_counter"] = 0
-        session.metadata["_active_turn_id"] = 0
-        session.metadata["_turn_lock"] = threading.Lock()
-        session.metadata["_active_queue"] = None
+        _init_session_metadata(session)
         _sessions[session.thread_key] = session
         recovered += 1
         log.info("pipe_session_recovered", thread_key=session.thread_key)
@@ -201,32 +224,69 @@ def _recover_sync() -> dict[str, Any]:
     return {"recovered": recovered}
 
 
+async def _sync_gen_to_async(gen_fn: Callable[..., Any], *args: Any) -> AsyncIterator[str]:
+    """Bridge a blocking generator to an async iterator via thread + asyncio.Queue."""
+    loop = asyncio.get_event_loop()
+    q: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def _run() -> None:
+        try:
+            for line in gen_fn(*args):
+                loop.call_soon_threadsafe(q.put_nowait, line)
+        except Exception as exc:
+            loop.call_soon_threadsafe(
+                q.put_nowait,
+                json.dumps({"type": "error", "message": str(exc)}),
+            )
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, None)
+
+    thread = asyncio.to_thread(_run)
+    task = asyncio.ensure_future(thread)
+
+    try:
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
 # ── Async public API (wraps sync backend calls in threads) ────────────────
 
 
-async def get_or_spawn(thread_key: str, harness: str = "amp") -> SandboxSession:
+async def get_or_spawn(
+    thread_key: str,
+    harness: str = "amp",
+    *,
+    backend: str | None = None,
+) -> SandboxSession:
     """Get existing session or spawn a new sandbox.
 
     Tries (in order): existing session → warm pool → cold spawn.
     """
     session = _sessions.get(thread_key)
     if session:
-        # Verify sandbox is still alive
-        backend = get_backend()
-        st = await asyncio.to_thread(backend.status, session)
+        sb = _backend_for(session)
+        st = await asyncio.to_thread(sb.status, session)
         if st == "running":
             return session
         _sessions.pop(thread_key, None)
 
-    # Try claiming a pre-warmed container (instant, no startup cost)
-    from api.warm_pool import claim_container
+    if not backend:
+        from api.warm_pool import claim_container
 
-    claimed = await asyncio.to_thread(claim_container, thread_key, harness)
-    if claimed:
-        _sessions[thread_key] = claimed
-        return claimed
+        claimed = await asyncio.to_thread(claim_container, thread_key, harness)
+        if claimed:
+            _sessions[thread_key] = claimed
+            return claimed
 
-    return await asyncio.to_thread(_spawn_sync, thread_key, harness)
+    return await asyncio.to_thread(_spawn_sync, thread_key, harness, backend_override=backend)
 
 
 def _reconnect_and_stream(session: SandboxSession):
@@ -236,7 +296,7 @@ def _reconnect_and_stream(session: SandboxSession):
     is assumed to be mid-turn already.  We just hook up a fresh stdout socket
     and relay whatever it produces until turn.done or EOF.
     """
-    backend = get_backend()
+    backend = _backend_for(session)
     # Force fresh sockets
     backend.close_streams(session)
     backend.attach(session, logs=True)
@@ -267,68 +327,14 @@ def _reconnect_and_stream(session: SandboxSession):
 
 async def stream_reconnect(session: SandboxSession) -> AsyncIterator[str]:
     """Async wrapper for reconnecting to a running sandbox's stdout."""
-    loop = asyncio.get_event_loop()
-    q: asyncio.Queue[str | None] = asyncio.Queue()
-
-    def _run() -> None:
-        try:
-            for line in _reconnect_and_stream(session):
-                loop.call_soon_threadsafe(q.put_nowait, line)
-        except Exception as exc:
-            loop.call_soon_threadsafe(
-                q.put_nowait,
-                json.dumps({"type": "error", "message": str(exc)}),
-            )
-        finally:
-            loop.call_soon_threadsafe(q.put_nowait, None)
-
-    thread = asyncio.to_thread(_run)
-    task = asyncio.ensure_future(thread)
-
-    try:
-        while True:
-            item = await q.get()
-            if item is None:
-                break
-            yield item
-    finally:
-        if not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+    async for line in _sync_gen_to_async(_reconnect_and_stream, session):
+        yield line
 
 
 async def stream_exec(session: SandboxSession, message: str) -> AsyncIterator[str]:
     """Run a command in the sandbox and yield raw stdout lines."""
-    loop = asyncio.get_event_loop()
-    q: asyncio.Queue[str | None] = asyncio.Queue()
-
-    def _run() -> None:
-        try:
-            for line in _send_turn_and_stream(session, message):
-                loop.call_soon_threadsafe(q.put_nowait, line)
-        except Exception as exc:
-            loop.call_soon_threadsafe(
-                q.put_nowait,
-                json.dumps({"type": "error", "message": str(exc)}),
-            )
-        finally:
-            loop.call_soon_threadsafe(q.put_nowait, None)
-
-    thread = asyncio.to_thread(_run)
-    task = asyncio.ensure_future(thread)
-
-    try:
-        while True:
-            item = await q.get()
-            if item is None:
-                break
-            yield item
-    finally:
-        if not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+    async for line in _sync_gen_to_async(_send_turn_and_stream, session, message):
+        yield line
 
 
 async def stop_session(thread_key: str) -> bool:
