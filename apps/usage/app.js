@@ -310,8 +310,10 @@ function init() {
     history.replaceState(null, "", viewPath("tools"));
   }
 
-  fetch("data.json")
-    .then((r) => r.json())
+  // Try live API first, fall back to static data.json
+  fetch("/usage-stats")
+    .then((r) => r.ok ? r.json() : Promise.reject("api"))
+    .catch(() => fetch("data.json").then((r) => r.json()))
     .then((d) => {
       DATA = d;
       // Compute calls_per_member for teams
