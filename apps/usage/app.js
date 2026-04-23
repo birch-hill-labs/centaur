@@ -183,6 +183,10 @@ function renderBody() {
       let val;
       if (c.key === "rank") {
         val = i + 1;
+      } else if (c.key === "first_seen" && r.first_url) {
+        val = `<a href="${escapeHtml(r.first_url)}" target="_blank" class="date-link">${r.first_seen}</a>`;
+      } else if (c.key === "last_seen" && r.last_url) {
+        val = `<a href="${escapeHtml(r.last_url)}" target="_blank" class="date-link">${r.last_seen}</a>`;
       } else if (c.num) {
         val = fmt(r[c.key]);
       } else {
