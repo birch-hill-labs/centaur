@@ -323,10 +323,16 @@ function init() {
     history.replaceState(null, "", viewPath("tools"));
   }
 
-  fetch("api/stats")
-    .then((r) => r.ok ? r.json() : Promise.reject("api"))
-    .catch(() => fetch("data.json").then((r) => r.json()))
-    .then((d) => {
+  Promise.all([
+    fetch("api/stats").then((r) => r.ok ? r.json() : Promise.reject("api")).catch(() => null),
+    fetch("data.json").then((r) => r.json()).catch(() => null),
+  ]).then(([live, static_]) => {
+    const d = live || static_ || { tools: [], skills: [], users: [], teams: [], apps: [], workflows: [] };
+    if (static_ && static_.users) {
+      const pfpMap = {};
+      for (const u of static_.users) { if (u.pfp) pfpMap[u.handle] = u.pfp; }
+      for (const u of (d.users || [])) { if (!u.pfp && pfpMap[u.handle]) u.pfp = pfpMap[u.handle]; }
+    }
       DATA = d;
       // Compute calls_per_member for teams
       if (DATA.teams) {
