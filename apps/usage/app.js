@@ -29,21 +29,26 @@ const TOOL_COLS = [
 ];
 
 const USER_COLS = [
-  { key: "rank",     label: "#",       num: true,  noSort: true, w: "3.5%" },
-  { key: "name",     label: "Name",    num: false, w: "14%",     cls: "user-name" },
-  { key: "handle",   label: "Handle",  num: false, w: "9%" },
+  { key: "rank",     label: "#",       num: true,  noSort: true, w: "3%" },
+  { key: "name",     label: "Name",    num: false, w: "16%",     cls: "user-name", hasPfp: true },
   { key: "calls",    label: "Calls",   num: true,  w: "7%" },
   { key: "threads",  label: "Threads", num: true,  w: "7%" },
   { key: "tools",    label: "Tools",   num: true,  w: "6%" },
-  { key: "calls_per_thread", label: "C/T", num: true, w: "6%", cls: "col-cpt" },
-  { key: "tool1",    label: "#1 Tool", num: false, w: "16%", noSort: true, cls: "method" },
-  { key: "tool2",    label: "#2 Tool", num: false, w: "16%", noSort: true, cls: "method col-method2" },
-  { key: "tool3",    label: "#3 Tool", num: false, w: "14%", noSort: true, cls: "method col-method3 col-tool3" },
+  { key: "calls_per_thread", label: "C/T", num: true, w: "5%", cls: "col-cpt" },
+  { key: "tool1",    label: "#1 Tool", num: false, w: "18%", noSort: true, cls: "method" },
+  { key: "tool2",    label: "#2 Tool", num: false, w: "18%", noSort: true, cls: "method col-method2" },
+  { key: "tool3",    label: "#3 Tool", num: false, w: "16%", noSort: true, cls: "method col-method3 col-tool3" },
 ];
 
 function fmt(n) {
   if (n == null) return "\u2014";
   return Number(n).toLocaleString();
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
 }
 
 function getCols() {
@@ -101,6 +106,14 @@ function renderHead() {
   $("#thead").innerHTML = `<tr>${ths}</tr>`;
 }
 
+function renderUserCell(r) {
+  const pfp = r.pfp
+    ? `<img class="pfp" src="${escapeHtml(r.pfp)}" loading="lazy" alt="">`
+    : `<span class="pfp pfp-placeholder"></span>`;
+  const handle = r.handle && r.handle !== "\u2014" ? `<span class="handle">@${escapeHtml(r.handle)}</span>` : "";
+  return `<td class="user-name"><span class="user-identity">${pfp}<span><span class="user-realname">${escapeHtml(r.name)}</span>${handle}</span></span></td>`;
+}
+
 function renderBody() {
   const cols = getCols();
   const rows = getRows();
@@ -108,12 +121,11 @@ function renderBody() {
 
   const html = rows.map((r, i) => {
     const tds = cols.map((c) => {
+      if (c.hasPfp && state.view === "users") return renderUserCell(r);
       const cls = [c.num ? "num" : "", c.cls || ""].filter(Boolean).join(" ");
       let val;
       if (c.key === "rank") {
         val = i + 1;
-      } else if (c.key === "handle" && state.view === "users") {
-        val = r.handle === "\u2014" ? "\u2014" : `@${r.handle}`;
       } else if (c.num) {
         val = fmt(r[c.key]);
       } else {
@@ -130,6 +142,40 @@ function renderBody() {
 function render() {
   renderHead();
   renderBody();
+  syncUrl();
+}
+
+function syncUrl() {
+  const p = new URLSearchParams();
+  p.set("view", state.view);
+  if (state.sort) p.set("sort", state.sort);
+  if (state.dir !== "desc") p.set("dir", state.dir);
+  if (state.search) p.set("q", state.search);
+  if (state.view === "tools") {
+    if (state.minCalls > 0) p.set("minCalls", state.minCalls);
+    if (state.minUsers > 0) p.set("minUsers", state.minUsers);
+  } else {
+    if (state.userMinCalls > 0) p.set("minCalls", state.userMinCalls);
+    if (state.userMinThreads > 0) p.set("minThreads", state.userMinThreads);
+  }
+  const qs = p.toString();
+  const url = location.pathname + (qs ? `?${qs}` : "");
+  history.replaceState(null, "", url);
+}
+
+function loadStateFromUrl() {
+  const p = new URLSearchParams(location.search);
+  if (p.has("view")) state.view = p.get("view");
+  if (p.has("sort")) state.sort = p.get("sort");
+  if (p.has("dir")) state.dir = p.get("dir");
+  if (p.has("q")) state.search = p.get("q");
+  if (state.view === "tools") {
+    if (p.has("minCalls")) state.minCalls = Number(p.get("minCalls"));
+    if (p.has("minUsers")) state.minUsers = Number(p.get("minUsers"));
+  } else {
+    if (p.has("minCalls")) state.userMinCalls = Number(p.get("minCalls"));
+    if (p.has("minThreads")) state.userMinThreads = Number(p.get("minThreads"));
+  }
 }
 
 function syncPills(name, value) {
@@ -140,11 +186,25 @@ function syncPills(name, value) {
   });
 }
 
+function syncAllPills() {
+  syncPills("view", state.view);
+  syncPills("min-calls", state.minCalls);
+  syncPills("min-users", state.minUsers);
+  syncPills("user-min-calls", state.userMinCalls);
+  syncPills("user-min-threads", state.userMinThreads);
+  $("#search").value = state.search;
+  $("#tools-filters").hidden = state.view !== "tools";
+  $("#users-filters").hidden = state.view !== "users";
+}
+
 function init() {
+  loadStateFromUrl();
+
   fetch("data.json")
     .then((r) => r.json())
     .then((d) => {
       DATA = d;
+      syncAllPills();
       render();
     });
 
@@ -167,6 +227,7 @@ function init() {
       state.minCalls = Number(r.value);
       syncPills("min-calls", r.value);
       renderBody();
+      syncUrl();
     });
   });
 
@@ -175,6 +236,7 @@ function init() {
       state.minUsers = Number(r.value);
       syncPills("min-users", r.value);
       renderBody();
+      syncUrl();
     });
   });
 
@@ -183,6 +245,7 @@ function init() {
       state.userMinCalls = Number(r.value);
       syncPills("user-min-calls", r.value);
       renderBody();
+      syncUrl();
     });
   });
 
@@ -191,12 +254,14 @@ function init() {
       state.userMinThreads = Number(r.value);
       syncPills("user-min-threads", r.value);
       renderBody();
+      syncUrl();
     });
   });
 
   $("#search").addEventListener("input", (e) => {
     state.search = e.target.value;
     renderBody();
+    syncUrl();
   });
 
   document.addEventListener("click", (e) => {
@@ -217,6 +282,12 @@ function init() {
       e.preventDefault();
       $("#search").focus();
     }
+  });
+
+  window.addEventListener("popstate", () => {
+    loadStateFromUrl();
+    syncAllPills();
+    render();
   });
 }
 
