@@ -26,8 +26,8 @@ const TOOL_COLS = [
 
 const USER_COLS = [
   { key: "rank",     label: "#",       num: true,  noSort: true, w: "3.5%" },
-  { key: "name",     label: "Name",    num: false, w: "17%",     cls: "user-name", hasPfp: true },
-  { key: "team",     label: "Team",    num: false, w: "10%",     cls: "col-team" },
+  { key: "name",     label: "Name",    num: false, w: "15%",     cls: "user-name", hasPfp: true },
+  { key: "team",     label: "Team",    num: false, w: "12%",     cls: "col-team" },
   { key: "calls",    label: "Calls",   num: true,  w: "7%" },
   { key: "threads",  label: "Threads", num: true,  w: "7%" },
   { key: "tools",    label: "Tools",   num: true,  w: "5.5%" },
