@@ -65,7 +65,7 @@ const SKILL_COLS = [
 const WORKFLOW_COLS = [
   { key: "rank",         label: "#",          num: true,  noSort: true, w: "3.5%" },
   { key: "workflow",     label: "Workflow",   num: false, w: "21%",     cls: "tool-name", hasWorkflowEmoji: true },
-  { key: "total",        label: "Total",      num: true,  w: "10%" },
+  { key: "total",        label: "Runs",       num: true,  w: "10%" },
   { key: "completed",    label: "Completed",  num: true,  w: "11%" },
   { key: "failed",       label: "Failed",     num: true,  w: "10%" },
   { key: "success_rate", label: "Success%",   num: true,  w: "11%" },
