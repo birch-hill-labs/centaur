@@ -35,6 +35,9 @@ importers:
 
   services/slackbot:
     dependencies:
+      '@centaur/api-client':
+        specifier: workspace:*
+        version: link:../../packages/api-client
       '@lmnr-ai/lmnr':
         specifier: ^0.8.23
         version: 0.8.23

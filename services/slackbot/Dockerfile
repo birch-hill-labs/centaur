@@ -3,10 +3,19 @@ FROM oven/bun:1.3.13-slim
 WORKDIR /app
 ENV NODE_ENV=production
 
-COPY services/slackbot/package.json services/slackbot/bun.lock ./
-RUN bun install --frozen-lockfile
+RUN bun install -g pnpm@10.28.1
 
-COPY services/slackbot/ ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/api-client/package.json packages/api-client/package.json
+COPY packages/harness-events/package.json packages/harness-events/package.json
+COPY services/slackbot/package.json services/slackbot/package.json
+RUN pnpm install --filter slackbot --prod --frozen-lockfile
+
+COPY packages/api-client packages/api-client
+COPY packages/harness-events packages/harness-events
+COPY services/slackbot services/slackbot
+
+WORKDIR /app/services/slackbot
 
 EXPOSE 3001
 ENV PORT=3001
