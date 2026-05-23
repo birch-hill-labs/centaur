@@ -465,13 +465,13 @@ async def spawn_assignment(
         effective_agents_md_override = active_assignment.get("agents_md_override")
     else:
         # Explicit harness wins; otherwise inherit from the persona's declared
-        # engine; otherwise default to codex.
+        # engine; otherwise default to claude-code.
         if harness:
             effective_harness = harness
         elif persona_info is not None:
             effective_harness = persona_info.engine
         else:
-            effective_harness = "codex"
+            effective_harness = "claude-code"
         effective_engine = engine
         effective_persona_id = persona_id
         effective_agents_md_override = agents_md_override
