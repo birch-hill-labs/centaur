@@ -314,6 +314,31 @@ def _proxy_policy_name(sandbox_id: str) -> str:
     return _resource_name("centaur-centaur-proxy-net", sandbox_id)
 
 
+def _onepassword_connect_egress_rules() -> list[dict[str, Any]]:
+    """Egress rules for iron-proxy → bundled 1Password Connect Service.
+
+    Returns an empty list unless the firewall manager is configured to use
+    onepassword-connect; in that case, returns a single egress rule allowing
+    TCP to pods labeled ``app: onepassword-connect`` (the upstream Connect
+    chart's default app label) on port 8080.
+
+    Without this rule, per-sandbox iron-proxy pods can't reach the in-cluster
+    Connect server to fetch model API keys (Anthropic/OpenAI), and outbound
+    requests go through without an Authorization header.
+    """
+    if (
+        os.getenv("KUBERNETES_FIREWALL_MANAGER_SECRET_SOURCE", "onepassword")
+        != "onepassword-connect"
+    ):
+        return []
+    return [
+        {
+            "to": [{"podSelector": {"matchLabels": {"app": "onepassword-connect"}}}],
+            "ports": [{"protocol": "TCP", "port": 8080}],
+        }
+    ]
+
+
 def _ensure_kubernetes_env() -> None:
     if not (os.getenv("AGENT_API_URL") or "").strip():
         raise ValueError("AGENT_API_URL is required for kubernetes backend")
@@ -766,6 +791,11 @@ class KubernetesExecutorBackend(SandboxBackend):
                         {
                             "ports": [{"protocol": "TCP", "port": 5432}],
                         },
+                        # When secret_source is onepassword-connect, per-sandbox
+                        # iron-proxy fetches credentials from the in-cluster
+                        # Connect Service. Without this egress rule, fetches
+                        # time out and outbound requests go through unauthenticated.
+                        *_onepassword_connect_egress_rules(),
                     ],
                 },
             },
