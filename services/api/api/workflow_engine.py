@@ -931,7 +931,7 @@ async def _compute_agent_session_title(
     if persona and (not harness or harness == persona):
         harness = _persona_default_engine(persona) or (None if harness == persona else harness)
     if not persona and not harness:
-        harness = "codex"
+        harness = "claude-code"
     parts = ["Centaur"]
     if persona:
         parts.append(str(persona))
