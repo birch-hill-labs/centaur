@@ -28,8 +28,15 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAMESPACE: paradigmxyz/centaur
-  IMAGE_SOURCE: https://github.com/paradigmxyz/centaur
+  # Fork patch: point at our GHCR namespace instead of upstream's. Our images
+  # live at ghcr.io/birch-hill-labs/centaur-api etc. — flat under the org, no
+  # extra /centaur path segment. Workflow_token doesn't have write access to
+  # ghcr.io/paradigmxyz/* so leaving the upstream default produces
+  # `denied: permission_denied` on push to main. This is one of the few
+  # patches our fork has to carry; reconsider upstreaming a vars.* override
+  # next time we're rebasing.
+  IMAGE_NAMESPACE: birch-hill-labs
+  IMAGE_SOURCE: https://github.com/birch-hill-labs/centaur
 
 jobs:
   publish:
