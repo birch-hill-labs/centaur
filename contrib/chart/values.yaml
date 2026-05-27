@@ -159,13 +159,6 @@ postgres:
     enabled: true
     size: 20Gi
     storageClassName: ""
-    # Volume mount subPath. Default "" mounts the PVC root at /var/lib/postgresql/data,
-    # which works on filesystems without a lost+found directory (Docker Desktop k8s,
-    # kind, XFS-backed storage). Set to "data" (or any non-empty name) on ext4-backed
-    # managed Kubernetes (DOKS, EKS default gp2/gp3, GKE default PD, Linode LKE, Vultr,
-    # Hetzner Cloud) where Postgres initdb refuses to initialize because the mount root
-    # contains lost+found.
-    subPath: ""
   resources: {}
 
 laminar:
