@@ -188,7 +188,7 @@ def _agent_session_title(
 ) -> str:
     parts = ["Centaur"]
     persona = (persona_id or "").strip()
-    runtime = (engine or harness or "claude-code").strip()
+    runtime = (engine or harness or "codex").strip()
     if persona:
         parts.append(persona)
     if runtime and runtime != persona:
@@ -459,7 +459,7 @@ async def spawn_assignment(
     )
 
     if active_assignment:
-        effective_harness = active_assignment.get("harness") or "claude-code"
+        effective_harness = active_assignment.get("harness") or "codex"
         effective_engine = active_assignment.get("engine")
         effective_persona_id = active_assignment.get("persona_id")
         effective_agents_md_override = active_assignment.get("agents_md_override")
@@ -1316,7 +1316,7 @@ async def enqueue_execution(
 
     _worker_wake.set()
 
-    resolved_harness = str(active["harness"] or harness or "claude-code")
+    resolved_harness = str(active["harness"] or harness or "codex")
     log.info(
         "execute_queued",
         thread_key=thread_key,

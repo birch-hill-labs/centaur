@@ -344,18 +344,6 @@ spec:
           port: 80
         - protocol: TCP
           port: 5432
-    {{- if eq .Values.ironProxy.secretSource "onepassword-connect" }}
-    # iron-proxy reaches the bundled 1Password Connect Service to fetch
-    # injected secrets (model API keys, tool tokens). Without this rule the
-    # fetches time out and outbound requests go through unauthenticated.
-    - to:
-        - podSelector:
-            matchLabels:
-              app: {{ include "centaur.onepasswordConnectAppName" . | quote }}
-      ports:
-        - protocol: TCP
-          port: {{ include "centaur.onepasswordConnectPort" . }}
-    {{- end }}
 ---
 {{- if eq .Values.ironProxy.secretSource "onepassword-connect" }}
 # Targets the 1Password Connect subchart's pods, which carry
