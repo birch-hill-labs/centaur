@@ -25,6 +25,8 @@ class _FakeWebClient:
         self.history_pages: list[dict] = []
         self.reply_calls: list[dict] = []
         self.reply_pages: list[dict] = []
+        self.open_calls: list[dict] = []
+        self.open_response: dict = {"channel": {"id": "D123"}}
         self.users_calls: list[dict] = []
         self.users_pages: list[dict] = []
         self.list_calls: list[dict] = []
@@ -36,6 +38,14 @@ class _FakeWebClient:
         self.user_profile_response: dict | None = None
         self.user_profile_calls: list[dict] = []
         self.upload_exception: Exception | None = None
+        self.upload_count = 0
+        # Per-upload-attempt share outcomes consumed by files_upload_v2.
+        # True = Slack shares the file; False = silent drop (ok but no share).
+        # Empty list defaults every attempt to a successful share.
+        self.share_outcomes: list[bool] = []
+        self.files_info_calls: list[dict] = []
+        self.files_delete_calls: list[dict] = []
+        self._shares_by_file: dict[str, dict] = {}
 
     def chat_postMessage(self, **kwargs):
         self.last_kwargs = kwargs
@@ -48,6 +58,10 @@ class _FakeWebClient:
     def conversations_replies(self, **kwargs):
         self.reply_calls.append(kwargs)
         return self.reply_pages.pop(0)
+
+    def conversations_open(self, **kwargs):
+        self.open_calls.append(kwargs)
+        return self.open_response
 
     def users_list(self, **kwargs):
         self.users_calls.append(kwargs)
@@ -73,7 +87,35 @@ class _FakeWebClient:
         self.last_kwargs = kwargs
         if self.upload_exception is not None:
             raise self.upload_exception
-        return {"file": {"id": "F123", "name": "upload.png"}}
+        self.upload_count += 1
+        file_id = f"F{self.upload_count}"
+        lands = self.share_outcomes.pop(0) if self.share_outcomes else True
+        if lands:
+            entry: dict = {"ts": "1.1", "channel_name": "paradigm-pulse"}
+            if kwargs.get("thread_ts"):
+                entry["thread_ts"] = kwargs["thread_ts"]
+            self._shares_by_file[file_id] = {
+                "public": {kwargs.get("channel", "C123"): [entry]}
+            }
+        else:
+            self._shares_by_file[file_id] = {}
+        return {
+            "file": {
+                "id": file_id,
+                "name": kwargs.get("filename", "upload.png"),
+                "permalink": f"https://slack.example/files/{file_id}",
+                "url_private": f"https://files.example/{file_id}",
+            }
+        }
+
+    def files_info(self, **kwargs):
+        self.files_info_calls.append(kwargs)
+        file_id = kwargs.get("file")
+        return {"file": {"id": file_id, "shares": self._shares_by_file.get(file_id, {})}}
+
+    def files_delete(self, **kwargs):
+        self.files_delete_calls.append(kwargs)
+        return {"ok": True}
 
     def api_call(self, method: str, *, params: dict):
         self.api_calls.append((method, params))
@@ -85,12 +127,9 @@ def _make_client() -> tuple[SlackClient, _FakeWebClient]:
     fake_web_client = _FakeWebClient()
     client._client = fake_web_client
     client._search_client = fake_web_client
-    client._etl_client = fake_web_client
-    client.etl_token = "SLACK_ETL_TOKEN"
     client._user_cache = {}
     client._ratelimit_deadlines = {}
     client._resolve_channel = lambda channel: "C123"  # type: ignore[method-assign]
-    client._resolve_etl_channel = lambda channel: "C123"  # type: ignore[method-assign]
     client._format_requester_attribution = lambda: ""  # type: ignore[method-assign]
     client.list_bot_channels = lambda **_: [{"id": "C123", "name": "paradigm-pulse"}]  # type: ignore[method-assign]
     return client, fake_web_client
@@ -128,6 +167,39 @@ def test_send_message_omits_unfurl_flags_by_default() -> None:
     assert fake_web_client.last_kwargs is not None
     assert "unfurl_links" not in fake_web_client.last_kwargs
     assert "unfurl_media" not in fake_web_client.last_kwargs
+
+
+def test_send_message_normalizes_escaped_line_breaks() -> None:
+    client, fake_web_client = _make_client()
+
+    client.send_message("paradigm-pulse", "*Title*\\n- one\\r\\n- two", no_attribution=True)
+
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["text"] == "*Title*\n- one\n- two"
+
+
+def test_send_message_opens_dm_for_user_id_destination() -> None:
+    client, fake_web_client = _make_client()
+
+    result = client.send_message("<@U123ABC>", "hello", no_attribution=True)
+
+    assert fake_web_client.open_calls == [{"users": "U123ABC"}]
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "D123"
+    assert fake_web_client.last_kwargs["text"] == "hello"
+    assert result["channel"] == "D123"
+    assert result["permalink"] == "https://slack.com/archives/D123/p123456"
+
+
+def test_send_dm_opens_dm_and_posts_message() -> None:
+    client, fake_web_client = _make_client()
+
+    client.send_dm("U234ABC", "hello", no_attribution=True, unfurl_links=False)
+
+    assert fake_web_client.open_calls == [{"users": "U234ABC"}]
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "D123"
+    assert fake_web_client.last_kwargs["unfurl_links"] is False
 
 
 def test_retry_on_ratelimit_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -254,46 +326,6 @@ def test_get_channel_history_page_surfaces_structured_auth_failure() -> None:
     }
 
 
-def test_list_etl_channels_uses_user_token_client() -> None:
-    client, bot_client = _make_client()
-    etl_client = _FakeWebClient()
-    client._etl_client = etl_client
-    etl_client.list_pages = [
-        {
-            "channels": [
-                {
-                    "id": "C2",
-                    "name": "research",
-                    "is_private": False,
-                    "is_member": False,
-                    "purpose": {"value": "Research"},
-                    "topic": {"value": "Ideas"},
-                    "num_members": 42,
-                },
-                {"id": "G1", "name": "private", "is_private": True},
-            ],
-            "response_metadata": {"next_cursor": ""},
-        }
-    ]
-
-    result = client._list_etl_channels(limit=10, force_refresh=True)
-
-    assert bot_client.list_calls == []
-    assert etl_client.list_calls[0]["types"] == "public_channel"
-    assert result == [
-        {
-            "id": "C2",
-            "name": "research",
-            "purpose": "Research",
-            "topic": "Ideas",
-            "member_count": 42,
-            "is_archived": False,
-            "is_private": False,
-            "is_member": False,
-        }
-    ]
-
-
 def test_get_user_profile_reads_labeled_custom_fields() -> None:
     client, fake_web_client = _make_client()
     fake_web_client.user_info_response = {
@@ -329,45 +361,6 @@ def test_get_user_profile_reads_labeled_custom_fields() -> None:
     assert profile["raw_custom_fields"] == {
         "Xf123": {"label": "Affiliations", "value": "GitHub: test-user", "alt": ""}
     }
-
-
-def test_get_etl_channel_history_page_uses_user_token_client_and_window() -> None:
-    client, bot_client = _make_client()
-    etl_client = _FakeWebClient()
-    client._etl_client = etl_client
-    client._get_etl_user_cache = lambda: {"U1": "alice", "U2": "bob"}  # type: ignore[method-assign]
-    etl_client.history_pages = [
-        {
-            "messages": [
-                {"user": "U1", "text": "first <@U2>", "ts": "200.000000"},
-            ],
-            "response_metadata": {"next_cursor": "cursor-2"},
-        }
-    ]
-
-    result = client._get_etl_channel_history_page(
-        "paradigm-pulse",
-        limit=1,
-        cursor="cursor-1",
-        oldest="2026-01-01",
-        latest="2026-01-02",
-        inclusive=True,
-    )
-
-    assert bot_client.history_calls == []
-    assert etl_client.history_calls == [
-        {
-            "channel": "C123",
-            "limit": 1,
-            "cursor": "cursor-1",
-            "oldest": client._normalize_ts("2026-01-01"),
-            "latest": client._normalize_ts("2026-01-02"),
-            "inclusive": True,
-        }
-    ]
-    assert result["has_more"] is True
-    assert result["next_cursor"] == "cursor-2"
-    assert result["messages"][0]["text"] == "first @bob"
 
 
 def test_get_channel_history_page_preserves_non_auth_error_shape() -> None:
@@ -519,26 +512,6 @@ def test_get_thread_replies_page_uses_bounded_default() -> None:
     assert result["continuation_available"] is False
 
 
-def test_get_etl_thread_replies_page_reports_user_token_auth_failures() -> None:
-    client, _ = _make_client()
-    etl_client = _FakeWebClient()
-    client._etl_client = etl_client
-    client._get_etl_user_cache = lambda: {}  # type: ignore[method-assign]
-
-    def fail_replies(**kwargs):
-        raise _make_slack_error(error="missing_scope", status_code=403)
-
-    etl_client.conversations_replies = fail_replies  # type: ignore[method-assign]
-
-    with pytest.raises(SlackAuthError) as excinfo:
-        client._get_etl_thread_replies_page("C123", "100.000000")
-
-    payload = json.loads(str(excinfo.value))
-    assert payload["access_path"] == "user_token"
-    assert payload["slack_method"] == "conversations.replies"
-    assert payload["error_code"] == "missing_scope"
-
-
 def test_dump_channel_with_threads_limits_thread_expansion() -> None:
     client, fake_web_client = _make_client()
     client._get_user_cache = lambda: {}  # type: ignore[method-assign]
@@ -620,7 +593,7 @@ def test_upload_file_accepts_channel_id_alias_and_returns_preview() -> None:
     assert fake_web_client.last_kwargs is not None
     assert fake_web_client.last_kwargs["channel"] == "C123"
     assert fake_web_client.last_kwargs["filename"] == "data.csv"
-    assert fake_web_client.last_kwargs["content"] == b"a,b\n1,2\n"
+    assert fake_web_client.last_kwargs["file"] == b"a,b\n1,2\n"
     assert result["preview"] == {
         "size_bytes": 8,
         "mime_type": "text/csv",
@@ -669,6 +642,93 @@ def test_upload_file_infers_destination_from_team_scoped_thread_key() -> None:
     assert fake_web_client.last_kwargs is not None
     assert fake_web_client.last_kwargs["channel"] == "C123"
     assert fake_web_client.last_kwargs["thread_ts"] == "1780035646.228899"
+
+
+def test_upload_file_uploads_once_and_returns_when_share_lands(monkeypatch) -> None:
+    """The stripped path does a single upload and verifies via files.info; no
+    retry, no orphan deletion."""
+    import slack.client as slack_client_module
+
+    monkeypatch.setattr(slack_client_module.time, "sleep", lambda *a, **k: None)
+
+    client, fake_web_client = _make_client()
+
+    result = client.upload_file(
+        channel_id="C123",
+        thread_ts="1780035646.228899",
+        content_base64="dGVzdA==",
+        filename="random.csv",
+    )
+
+    assert fake_web_client.upload_count == 1
+    assert fake_web_client.files_delete_calls == []
+    assert result["id"] == "F1"
+
+
+def test_upload_file_returns_dropped_result_without_retry(monkeypatch) -> None:
+    """A silent share drop is logged but not retried or deleted; the (phantom)
+    result is returned so we can observe the raw rate."""
+    import slack.client as slack_client_module
+
+    monkeypatch.setattr(slack_client_module.time, "sleep", lambda *a, **k: None)
+
+    client, fake_web_client = _make_client()
+    fake_web_client.share_outcomes = [False]  # share never lands
+
+    result = client.upload_file(
+        channel_id="C123",
+        thread_ts="1780035646.228899",
+        content_base64="dGVzdA==",
+        filename="random.csv",
+    )
+
+    assert fake_web_client.upload_count == 1
+    assert fake_web_client.files_delete_calls == []
+    assert result["id"] == "F1"
+
+
+def test_upload_file_returns_result_when_verification_unavailable(monkeypatch) -> None:
+    """When files.info cannot confirm the share (e.g. missing files:read scope),
+    upload_file returns the result as-is."""
+    import slack.client as slack_client_module
+
+    monkeypatch.setattr(slack_client_module.time, "sleep", lambda *a, **k: None)
+
+    client, fake_web_client = _make_client()
+
+    def _boom(**_kwargs):
+        raise _make_slack_error(error="missing_scope", status_code=403)
+
+    fake_web_client.files_info = _boom  # type: ignore[method-assign]
+
+    result = client.upload_file(
+        channel_id="C123",
+        thread_ts="1780035646.228899",
+        content_base64="dGVzdA==",
+        filename="random.csv",
+    )
+
+    assert fake_web_client.upload_count == 1
+    assert fake_web_client.files_delete_calls == []
+    assert result["id"] == "F1"
+
+
+def test_upload_file_never_sends_alt_txt(monkeypatch) -> None:
+    """alt_text is accepted for compatibility but never forwarded to Slack,
+    because slack_sdk's files_upload_v2 mishandles alt_txt
+    (slackapi/python-slack-sdk#1818)."""
+    import slack.client as slack_client_module
+
+    monkeypatch.setattr(slack_client_module.time, "sleep", lambda *a, **k: None)
+
+    client, fake_web_client = _make_client()
+    client.upload_file(
+        channel_id="C123",
+        content_base64="dGVzdA==",
+        filename="chart.png",
+        alt_text="a bar chart",
+    )
+    assert "alt_txt" not in fake_web_client.last_kwargs
 
 
 def test_upload_file_rejects_local_path_argument() -> None:
