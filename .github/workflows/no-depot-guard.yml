@@ -22,14 +22,14 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - name: Fail if Depot is referenced in the image-build workflow
+      - name: Fail if Depot is referenced in any workflow
         run: |
-          # Scoped to publish-images.yml (the deploy-critical image build). The
-          # rest of the fork's CI is still on Depot pending a separate decision;
-          # broaden this list as those workflows are de-Depot'd.
-          if grep -niE 'depot-ubuntu|depot/(setup-action|build-push-action|bake-action)' \
-              .github/workflows/publish-images.yml; then
-            echo "::error::Depot reference found in publish-images.yml. Birch Hill builds images on GitHub-hosted runners — keep the de-Depot patch when syncing upstream."
+          # Birch Hill runs all CI on GitHub-hosted runners. Upstream uses Depot;
+          # this fails any PR (incl. upstream syncs) that reintroduces Depot
+          # runners or actions into any workflow.
+          if grep -rniE 'depot-ubuntu|depot/(setup-action|build-push-action|bake-action)' \
+              .github/workflows/ --exclude=no-depot-guard.yml; then
+            echo "::error::Depot reference found in .github/workflows/. Birch Hill builds on GitHub-hosted runners — keep the de-Depot patches when syncing upstream (see publish-images.yml)."
             exit 1
           fi
-          echo "OK — no Depot runners or actions in publish-images.yml."
+          echo "OK — no Depot runners or actions in any workflow."
