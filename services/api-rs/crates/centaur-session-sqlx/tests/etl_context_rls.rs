@@ -11,7 +11,13 @@ const SLACK_ATTACHMENTS_RLS_SQL: &str =
     include_str!("../migrations/0017_slack_sync_message_attachments.sql");
 const SLACK_CONTEXT_ADMIN_CHANNELS_SQL: &str =
     include_str!("../migrations/0018_slack_context_rls_admin_channels.sql");
+const CENTAUR_READONLY_ROLE_ONLY_SQL: &str =
+    include_str!("../migrations/0020_centaur_readonly_role_only.sql");
 const ETL_CONTEXT_RLS_SQL: &str = include_str!("../migrations/0021_etl_context_rls.sql");
+const DROP_SLACK_CONTEXT_ADMIN_CHANNELS_SQL: &str =
+    include_str!("../migrations/0022_drop_slack_context_rls_admin_channels.sql");
+const CENTAUR_READONLY_RLS_POLICIES_SQL: &str =
+    include_str!("../migrations/0023_centaur_readonly_rls_policies.sql");
 
 const RLS_TABLES: &[&str] = &[
     "slack_sync_channels",
@@ -55,7 +61,7 @@ struct VisibleRows {
 }
 
 #[tokio::test]
-async fn etl_context_rls_enforces_channel_and_admin_visibility() -> Result<(), Box<dyn Error>> {
+async fn etl_context_rls_enforces_channel_visibility() -> Result<(), Box<dyn Error>> {
     let Some(database_url) = test_database_url() else {
         return Ok(());
     };
@@ -74,12 +80,15 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
     execute_migration(conn, SLACK_ATTACHMENTS_RLS_SQL).await?;
     execute_migration(conn, SLACK_CONTEXT_ADMIN_CHANNELS_SQL).await?;
     create_minimal_non_slack_etl_tables(conn).await?;
+    execute_migration(conn, CENTAUR_READONLY_ROLE_ONLY_SQL).await?;
     execute_migration(conn, ETL_CONTEXT_RLS_SQL).await?;
+    execute_migration(conn, DROP_SLACK_CONTEXT_ADMIN_CHANNELS_SQL).await?;
+    execute_migration(conn, CENTAUR_READONLY_RLS_POLICIES_SQL).await?;
     grant_schema_usage(conn, schema).await?;
 
     assert_rls_enabled(conn).await?;
     assert_expected_policies(conn).await?;
-    assert_admin_channels_are_not_seeded(conn).await?;
+    assert_legacy_admin_state_is_removed(conn).await?;
 
     insert_fixture_rows(conn).await?;
 
@@ -138,11 +147,33 @@ async fn run_rls_assertions(conn: &mut PgConnection, schema: &str) -> Result<(),
     let unset_channel = visible_rows(conn, schema, "centaur_slack_reader", None).await?;
     assert_eq!(unset_channel, empty_visible_rows());
 
-    let admin_channel = visible_rows(conn, schema, "centaur_slack_reader", Some("C_ADMIN")).await?;
-    assert_eq!(admin_channel, all_visible_rows());
+    let formerly_admin_channel =
+        visible_rows(conn, schema, "centaur_slack_reader", Some("C_ADMIN")).await?;
+    assert_eq!(
+        formerly_admin_channel,
+        VisibleRows {
+            slack_channels: vec!["C_ADMIN".to_owned()],
+            slack_users: vec![],
+            slack_messages: vec![],
+            slack_attachments: vec![],
+            context_docs: vec![],
+            google_drive_runs: 0,
+            google_drive_files: 0,
+            google_drive_checkpoints: 0,
+            google_calendar_runs: 0,
+            google_calendar_calendars: 0,
+            google_calendar_events: 0,
+            google_calendar_checkpoints: 0,
+            linear_runs: 0,
+            linear_projects: 0,
+            linear_issues: 0,
+            linear_comments: 0,
+            linear_checkpoints: 0,
+        }
+    );
 
-    let db_admin_role = visible_rows(conn, schema, "centaur_slack_admin", None).await?;
-    assert_eq!(db_admin_role, all_visible_rows());
+    let readonly_role = visible_rows(conn, schema, "centaur_readonly", None).await?;
+    assert_eq!(readonly_role, all_visible_rows());
 
     Ok(())
 }
@@ -187,7 +218,15 @@ async fn set_search_path(conn: &mut PgConnection, schema: &str) -> Result<(), sq
 async fn grant_schema_usage(conn: &mut PgConnection, schema: &str) -> Result<(), sqlx::Error> {
     conn.execute(
         format!(
-            r#"grant usage on schema "{}" to centaur_slack_reader, centaur_slack_admin"#,
+            r#"grant usage on schema "{}" to centaur_slack_reader, centaur_readonly"#,
+            schema
+        )
+        .as_str(),
+    )
+    .await?;
+    conn.execute(
+        format!(
+            r#"grant select on all tables in schema "{}" to centaur_readonly"#,
             schema
         )
         .as_str(),
@@ -306,26 +345,29 @@ async fn assert_expected_policies(conn: &mut PgConnection) -> Result<(), sqlx::E
             expected.0
         );
     }
+
+    for table in RLS_TABLES {
+        let expected = (*table, format!("centaur_readonly_{table}_select"));
+        assert!(
+            policies
+                .iter()
+                .any(|(table, policy)| table == expected.0 && policy == &expected.1),
+            "missing centaur_readonly RLS policy on {table}"
+        );
+    }
     Ok(())
 }
 
 fn expected_policies() -> Vec<(String, String)> {
     [
-        ("slack_sync_channels", "centaur_slack_channels_admin_select"),
         (
             "slack_sync_channels",
             "centaur_slack_channels_reader_select",
         ),
-        ("slack_sync_users", "centaur_slack_users_admin_select"),
         ("slack_sync_users", "centaur_slack_users_reader_select"),
-        ("slack_sync_messages", "centaur_slack_messages_admin_select"),
         (
             "slack_sync_messages",
             "centaur_slack_messages_reader_select",
-        ),
-        (
-            "slack_sync_message_attachments",
-            "centaur_slack_message_attachments_admin_select",
         ),
         (
             "slack_sync_message_attachments",
@@ -333,95 +375,117 @@ fn expected_policies() -> Vec<(String, String)> {
         ),
         (
             "company_context_documents",
-            "centaur_context_docs_admin_select",
-        ),
-        (
-            "company_context_documents",
             "centaur_context_docs_reader_select",
         ),
         (
-            "google_drive_sync_runs",
-            "centaur_google_drive_runs_admin_select",
+            "company_context_documents",
+            "centaur_readonly_company_context_documents_select",
         ),
         (
             "google_drive_sync_runs",
             "centaur_google_drive_runs_reader_select",
         ),
         (
-            "google_drive_sync_files",
-            "centaur_google_drive_files_admin_select",
+            "google_drive_sync_runs",
+            "centaur_readonly_google_drive_sync_runs_select",
         ),
         (
             "google_drive_sync_files",
             "centaur_google_drive_files_reader_select",
         ),
         (
-            "google_drive_sync_checkpoints",
-            "centaur_google_drive_checkpoints_admin_select",
+            "google_drive_sync_files",
+            "centaur_readonly_google_drive_sync_files_select",
         ),
         (
             "google_drive_sync_checkpoints",
             "centaur_google_drive_checkpoints_reader_select",
         ),
         (
-            "google_calendar_sync_runs",
-            "centaur_google_calendar_runs_admin_select",
+            "google_drive_sync_checkpoints",
+            "centaur_readonly_google_drive_sync_checkpoints_select",
         ),
         (
             "google_calendar_sync_runs",
             "centaur_google_calendar_runs_reader_select",
         ),
         (
-            "google_calendar_sync_calendars",
-            "centaur_google_calendar_calendars_admin_select",
+            "google_calendar_sync_runs",
+            "centaur_readonly_google_calendar_sync_runs_select",
         ),
         (
             "google_calendar_sync_calendars",
             "centaur_google_calendar_calendars_reader_select",
         ),
         (
-            "google_calendar_sync_events",
-            "centaur_google_calendar_events_admin_select",
+            "google_calendar_sync_calendars",
+            "centaur_readonly_google_calendar_sync_calendars_select",
         ),
         (
             "google_calendar_sync_events",
             "centaur_google_calendar_events_reader_select",
         ),
         (
-            "google_calendar_sync_checkpoints",
-            "centaur_google_calendar_checkpoints_admin_select",
+            "google_calendar_sync_events",
+            "centaur_readonly_google_calendar_sync_events_select",
         ),
         (
             "google_calendar_sync_checkpoints",
             "centaur_google_calendar_checkpoints_reader_select",
         ),
-        ("linear_sync_runs", "centaur_linear_runs_admin_select"),
+        (
+            "google_calendar_sync_checkpoints",
+            "centaur_readonly_google_calendar_sync_checkpoints_select",
+        ),
         ("linear_sync_runs", "centaur_linear_runs_reader_select"),
         (
-            "linear_sync_projects",
-            "centaur_linear_projects_admin_select",
+            "linear_sync_runs",
+            "centaur_readonly_linear_sync_runs_select",
         ),
         (
             "linear_sync_projects",
             "centaur_linear_projects_reader_select",
         ),
-        ("linear_sync_issues", "centaur_linear_issues_admin_select"),
+        (
+            "linear_sync_projects",
+            "centaur_readonly_linear_sync_projects_select",
+        ),
         ("linear_sync_issues", "centaur_linear_issues_reader_select"),
         (
-            "linear_sync_comments",
-            "centaur_linear_comments_admin_select",
+            "linear_sync_issues",
+            "centaur_readonly_linear_sync_issues_select",
         ),
         (
             "linear_sync_comments",
             "centaur_linear_comments_reader_select",
         ),
         (
-            "linear_sync_checkpoints",
-            "centaur_linear_checkpoints_admin_select",
+            "linear_sync_comments",
+            "centaur_readonly_linear_sync_comments_select",
         ),
         (
             "linear_sync_checkpoints",
             "centaur_linear_checkpoints_reader_select",
+        ),
+        (
+            "linear_sync_checkpoints",
+            "centaur_readonly_linear_sync_checkpoints_select",
+        ),
+        (
+            "slack_sync_channels",
+            "centaur_readonly_slack_sync_channels_select",
+        ),
+        (
+            "slack_sync_users",
+            "centaur_readonly_slack_sync_users_select",
+        ),
+        (
+            "slack_sync_messages",
+            "centaur_readonly_slack_sync_messages_select",
+        ),
+        (
+            "slack_sync_message_attachments",
+            "centaur_readonly_slack_sync_message_attachments_select",
         ),
     ]
     .into_iter()
@@ -429,19 +493,40 @@ fn expected_policies() -> Vec<(String, String)> {
     .collect()
 }
 
-async fn assert_admin_channels_are_not_seeded(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
-    let count: i64 = sqlx::query_scalar("select count(*) from slack_context_rls_admin_channels")
-        .fetch_one(&mut *conn)
-        .await?;
-    assert_eq!(count, 0, "admin channels must be deployment-configured");
+async fn assert_legacy_admin_state_is_removed(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    let table_name: Option<String> =
+        sqlx::query_scalar("select to_regclass('slack_context_rls_admin_channels')::text")
+            .fetch_one(&mut *conn)
+            .await?;
+    assert_eq!(
+        table_name, None,
+        "admin channels must be managed by iron-control"
+    );
+
+    let function_count: i64 = sqlx::query_scalar(
+        "select count(*) from pg_proc where proname = 'centaur_etl_admin_channel'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    assert_eq!(
+        function_count, 0,
+        "admin-channel lookup function must be removed"
+    );
+
+    let admin_role_count: i64 =
+        sqlx::query_scalar("select count(*) from pg_roles where rolname = 'centaur_slack_admin'")
+            .fetch_one(&mut *conn)
+            .await?;
+    assert_eq!(
+        admin_role_count, 0,
+        "legacy slack admin DB role must be removed"
+    );
     Ok(())
 }
 
 async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(
         r#"
-        insert into slack_context_rls_admin_channels (channel_id) values ('C_ADMIN');
-
         insert into slack_sync_channels (channel_id, channel_name) values
             ('C_ALPHA', 'alpha'),
             ('C_BETA', 'beta'),
