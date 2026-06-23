@@ -1,0 +1,35 @@
+name: no-depot-guard
+
+# Birch Hill builds container images on GitHub-hosted runners, not Depot.
+# Upstream (paradigmxyz/centaur) uses Depot; an upstream sync once reintroduced
+# that dependency silently and broke image builds for days. This guard fails any
+# PR — including an upstream sync — that brings Depot runners or actions back into
+# our workflows, so it can never slip in unnoticed again. See publish-images.yml.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  no-depot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Fail if Depot is referenced in the image-build workflow
+        run: |
+          # Scoped to publish-images.yml (the deploy-critical image build). The
+          # rest of the fork's CI is still on Depot pending a separate decision;
+          # broaden this list as those workflows are de-Depot'd.
+          if grep -niE 'depot-ubuntu|depot/(setup-action|build-push-action|bake-action)' \
+              .github/workflows/publish-images.yml; then
+            echo "::error::Depot reference found in publish-images.yml. Birch Hill builds images on GitHub-hosted runners — keep the de-Depot patch when syncing upstream."
+            exit 1
+          fi
+          echo "OK — no Depot runners or actions in publish-images.yml."
