@@ -75,10 +75,6 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
         workflow_host_principal = Some(iron_control.workflow_host_principal);
         runtime = runtime.with_iron_control(iron_control.registrar);
     }
-    if let Some(reconciler) = args.iron_control_tool_reconciler()? {
-        info!("iron-control tool secret reconciliation enabled");
-        tokio::spawn(reconciler.run());
-    }
     runtime = runtime.with_personas(args.persona_registry()?);
     let sandbox_capacity_config = args.sandbox_capacity_config();
     if let Some(config) = sandbox_capacity_config {
