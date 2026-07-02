@@ -838,12 +838,14 @@ dependencies = [
 name = "centaur-iron-control"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "centaur-iron-proxy",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror",
+ "tokio",
  "urlencoding",
 ]
 
@@ -934,6 +936,7 @@ dependencies = [
  "centaur-sandbox-core",
  "centaur-session-sqlx",
  "centaur-telemetry",
+ "sqlx",
  "thiserror",
  "tokio",
  "tracing",
@@ -979,9 +982,11 @@ dependencies = [
  "centaur-telemetry",
  "dashmap",
  "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "thiserror",
  "time",
  "tokio",
@@ -1012,9 +1017,12 @@ dependencies = [
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
+ "prost",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

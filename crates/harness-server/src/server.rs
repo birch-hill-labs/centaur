@@ -18,15 +18,16 @@ use codex_app_server_protocol::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use url::Url;
 use uuid::Uuid;
 
 use crate::amp::AmpHarness;
 use crate::claude::ClaudeCodeHarness;
 use crate::codex::CodexHarnessServer;
-use crate::otel::TraceContext;
+use crate::otel::{self, HarnessUsageSpan, TraceContext};
 use crate::traits::{
     AppServerNormalizer, AppServerRuntime, HarnessChild, HarnessKind, HarnessServer,
-    NormalizedEvent, ThreadState,
+    NormalizedContent, NormalizedEvent, NormalizedTokenUsage, ThreadState,
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
 use crate::util::{absolute_path, default_codex_home, write_value};
@@ -98,7 +99,7 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 // knob (its provider is fixed at thread start from session params).
                 provider: _,
                 reasoning: _,
-                trace_context: _,
+                trace_context,
             }) => {
                 if let Some(model) = model {
                     state.model = model;
@@ -108,6 +109,7 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                     &mut state,
                     input,
                     client_user_message_id,
+                    &trace_context,
                     &mut stdout,
                     &request_rx,
                 ) {
@@ -181,6 +183,7 @@ fn run_blocks_turn<H: HarnessServer, W: Write>(
     state: &mut ThreadState,
     input: Vec<UserInput>,
     client_user_message_id: Option<String>,
+    trace_context: &TraceContext,
     stdout: &mut W,
     request_rx: &Receiver<JSONRPCRequest>,
 ) -> Result<()> {
@@ -191,6 +194,7 @@ fn run_blocks_turn<H: HarnessServer, W: Write>(
         state,
         &input,
         client_user_message_id,
+        Some(trace_context),
         &mut normalizer,
         stdout,
         request_rx,
@@ -311,9 +315,16 @@ enum BlocksInput {
 struct AttachmentBlock {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(
+        rename = "attachment_id",
+        alias = "attachmentId",
+        alias = "id",
+        default
+    )]
+    attachment_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
-    #[serde(rename = "mimeType", default)]
+    #[serde(rename = "mimeType", alias = "mime_type", default)]
     mime_type: Option<String>,
     #[serde(rename = "attachment_type", default)]
     attachment_type: Option<String>,
@@ -354,7 +365,7 @@ pub(crate) fn parse_blocks_line_with_state(
                 .and_then(|message| message.content.as_ref())
                 .or(parsed.content.as_ref());
             let mut input = match content {
-                Some(content) => blocks_content_to_user_input(content, state)?,
+                Some(content) => blocks_content_to_user_input(content, state, &trace_context)?,
                 None => parsed
                     .text
                     .map(|text| {
@@ -405,11 +416,12 @@ pub(crate) fn parse_blocks_line_with_state(
 fn blocks_content_to_user_input(
     content: &BlocksContent,
     state: &mut BlocksState,
+    trace_context: &TraceContext,
 ) -> Result<Vec<UserInput>> {
     match content {
         BlocksContent::Inputs(input) => input
             .iter()
-            .map(|item| blocks_input_to_user_input(item, state))
+            .map(|item| blocks_input_to_user_input(item, state, trace_context))
             .collect::<Result<Vec<_>>>()
             .map(|items| items.into_iter().flatten().collect()),
         BlocksContent::Text(text) => Ok(vec![UserInput::Text {
@@ -422,17 +434,123 @@ fn blocks_content_to_user_input(
 fn blocks_input_to_user_input(
     input: &BlocksInput,
     state: &mut BlocksState,
+    trace_context: &TraceContext,
 ) -> Result<Vec<UserInput>> {
     match input {
         BlocksInput::UserInput(input) => Ok(vec![input.clone()]),
         BlocksInput::Attachment(block) if block.kind == "attachment" => {
             attachment_block_to_user_input(block, state)
         }
+        BlocksInput::Attachment(block) if block.kind == "attachment_ref" => {
+            Ok(attachment_ref_block_to_user_input(block, trace_context))
+        }
         BlocksInput::Attachment(block) => Ok(vec![UserInput::Text {
             text: format!("[Unsupported attachment block type: {}]", block.kind),
             text_elements: Vec::new(),
         }]),
     }
+}
+
+fn attachment_ref_block_to_user_input(
+    block: &AttachmentBlock,
+    trace_context: &TraceContext,
+) -> Vec<UserInput> {
+    let attachment_id = non_empty(block.attachment_id.as_deref());
+    let mime_type = non_empty(block.mime_type.as_deref());
+    let attachment_type = non_empty(block.attachment_type.as_deref());
+    let name = non_empty(block.name.as_deref()).unwrap_or("attachment");
+
+    if let (Some(attachment_id), Some(thread_key)) = (
+        attachment_id,
+        non_empty(trace_context.thread_key.as_deref()),
+    ) {
+        match download_attachment_ref(attachment_id, thread_key, name, mime_type) {
+            Ok(path) => {
+                return local_file_inputs(
+                    &path,
+                    mime_type,
+                    is_image_attachment(attachment_type, mime_type),
+                );
+            }
+            Err(error) => {
+                return vec![UserInput::Text {
+                    text: format!(
+                        "[Attachment reference could not be downloaded: id={attachment_id} name={name} error={error}. The file is not preloaded in /home/agent/uploads; recover it locally before inspecting it.]"
+                    ),
+                    text_elements: Vec::new(),
+                }];
+            }
+        }
+    }
+
+    let mut fields = Vec::new();
+    if let Some(attachment_id) = attachment_id {
+        fields.push(format!("id={attachment_id}"));
+    }
+    fields.push(format!("name={name}"));
+    if let Some(mime_type) = mime_type {
+        fields.push(format!("mime={mime_type}"));
+    }
+
+    let summary = if fields.is_empty() {
+        "attachment_ref".to_string()
+    } else {
+        format!("attachment_ref {}", fields.join(" "))
+    };
+    vec![UserInput::Text {
+        text: format!(
+            "[Attachment reference: {summary}. The file is not preloaded in /home/agent/uploads; recover it locally before inspecting it.]"
+        ),
+        text_elements: Vec::new(),
+    }]
+}
+
+fn download_attachment_ref(
+    attachment_id: &str,
+    thread_key: &str,
+    name: &str,
+    mime_type: Option<&str>,
+) -> std::result::Result<PathBuf, String> {
+    let api_base = attachment_api_base().ok_or_else(|| "CENTAUR_API_URL is not set".to_string())?;
+    let url = attachment_download_url(&api_base, attachment_id, thread_key)?;
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| error.to_string())?
+        .get(url)
+        .send()
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("download returned HTTP {status}"));
+    }
+    let bytes = response.bytes().map_err(|error| error.to_string())?;
+    let path = unique_upload_path(name, mime_type).map_err(|error| error.to_string())?;
+    std::fs::write(&path, &bytes).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn attachment_api_base() -> Option<String> {
+    ["CENTAUR_API_URL", "SESSION_SANDBOX_CENTAUR_API_URL"]
+        .iter()
+        .find_map(|name| non_empty(env::var(name).ok().as_deref()).map(str::to_owned))
+}
+
+fn attachment_download_url(
+    api_base: &str,
+    attachment_id: &str,
+    thread_key: &str,
+) -> std::result::Result<Url, String> {
+    let mut url = Url::parse(api_base.trim_end_matches('/')).map_err(|error| error.to_string())?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "attachment API base URL cannot be a base".to_string())?;
+        segments.pop_if_empty();
+        segments.extend(["agent", "attachments", attachment_id, "download"]);
+    }
+    url.query_pairs_mut().append_pair("thread_key", thread_key);
+    Ok(url)
 }
 
 fn attachment_block_to_user_input(
@@ -789,6 +907,7 @@ fn handle_request<H: HarnessServer, W: Write>(
                 state,
                 &params.input,
                 params.client_user_message_id.clone(),
+                None,
                 &mut normalizer,
                 stdout,
                 request_rx,
@@ -964,6 +1083,7 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
     state: &mut ThreadState,
     input: &[UserInput],
     client_user_message_id: Option<String>,
+    trace_context: Option<&TraceContext>,
     normalizer: &mut CodexTurnNormalizer,
     stdout: &mut W,
     request_rx: &Receiver<JSONRPCRequest>,
@@ -978,7 +1098,15 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
         write_value(stdout, &notification_to_wire_value(&notification)?)?;
     }
 
-    match run_harness_turn(harness, state, input, normalizer, stdout, request_rx) {
+    match run_harness_turn(
+        harness,
+        state,
+        input,
+        trace_context,
+        normalizer,
+        stdout,
+        request_rx,
+    ) {
         Ok(Some(turn)) => state.completed_turns.push(turn),
         Ok(None) => {}
         Err(error) => finish_turn_with_error(state, normalizer, stdout, error)?,
@@ -1012,10 +1140,17 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     harness: &H,
     state: &mut ThreadState,
     input: &[UserInput],
+    trace_context: Option<&TraceContext>,
     normalizer: &mut CodexTurnNormalizer,
     stdout: &mut W,
     request_rx: &Receiver<JSONRPCRequest>,
 ) -> Result<Option<codex_app_server_protocol::Turn>> {
+    let usage_span_start = otel::unix_time_nanos();
+    let usage_span_model = state.model.clone();
+    let usage_span_model_provider = state.model_provider.clone();
+    let usage_span_turn_id = normalizer.turn_id().to_string();
+    let usage_span_input = usage_span_input_value(input);
+    let mut usage_span_output = UsageSpanOutput::default();
     ensure_harness_process(harness, state)?;
     let process = state
         .process
@@ -1027,6 +1162,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     let mut last_session_id = state.harness_session_id.clone();
     let mut event_normalizer = H::EventNormalizer::default();
     let mut completed_turn = None;
+    let mut latest_usage = None;
     loop {
         while let Ok(request) = request_rx.try_recv() {
             handle_active_turn_request(harness, process, normalizer, request, stdout)?;
@@ -1052,6 +1188,10 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
         let normalized_events = harness.normalize_events(&mut event_normalizer, event)?;
         let mut terminal = false;
         for normalized in normalized_events {
+            if let Some(usage) = normalized.token_usage() {
+                latest_usage = Some(usage.clone());
+            }
+            append_usage_span_output(&normalized, &mut usage_span_output);
             if let Some(session_id) = normalized.session_id() {
                 last_session_id = Some(session_id.to_string());
                 state.harness_session_id = Some(session_id.to_string());
@@ -1064,6 +1204,17 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     && normalized.is_assistant_end_turn());
         }
         if terminal {
+            export_harness_usage_if_available(
+                trace_context,
+                harness.kind(),
+                &usage_span_model,
+                &usage_span_model_provider,
+                &usage_span_turn_id,
+                usage_span_input.as_deref(),
+                usage_span_output.value().as_deref(),
+                usage_span_start,
+                latest_usage.as_ref(),
+            );
             if let Some(notification) = normalizer.finish_turn(None)? {
                 if let ServerNotification::TurnCompleted(completed) = &notification {
                     completed_turn = Some(completed.turn.clone());
@@ -1084,6 +1235,125 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
         write_value(stdout, &notification_to_wire_value(&notification)?)?;
     }
     Ok(completed_turn)
+}
+
+fn export_harness_usage_if_available(
+    trace_context: Option<&TraceContext>,
+    harness: HarnessKind,
+    model: &str,
+    model_provider: &str,
+    turn_id: &str,
+    input: Option<&str>,
+    output: Option<&str>,
+    start_unix_nano: u64,
+    usage: Option<&NormalizedTokenUsage>,
+) {
+    let (Some(trace_context), Some(usage)) = (trace_context, usage) else {
+        return;
+    };
+    let span = HarnessUsageSpan {
+        harness,
+        model,
+        model_provider,
+        turn_id,
+        input,
+        output,
+        start_unix_nano,
+        end_unix_nano: otel::unix_time_nanos(),
+    };
+    if let Err(error) = otel::export_harness_usage_span(trace_context, span, usage) {
+        eprintln!("harness usage OTLP export failed: {error:#}");
+    }
+}
+
+fn usage_span_input_value(input: &[UserInput]) -> Option<String> {
+    let mut parts = Vec::new();
+    for item in input {
+        match item {
+            UserInput::Text { text, .. } => parts.push(text.clone()),
+            UserInput::Image { url, .. } => parts.push(format!("[image: {url}]")),
+            UserInput::LocalImage { path, .. } => {
+                parts.push(format!("[local image: {}]", path.display()));
+            }
+            UserInput::Skill { name, path } => {
+                parts.push(format!("[skill: {name} at {}]", path.display()));
+            }
+            UserInput::Mention { name, path } => {
+                parts.push(format!("[mention: {name} at {path}]"));
+            }
+        }
+    }
+    let joined = parts.join("\n");
+    non_empty(Some(&joined)).map(str::to_owned)
+}
+
+#[derive(Debug, Default)]
+struct UsageSpanOutput {
+    item_order: Vec<String>,
+    text_by_item_id: HashMap<String, String>,
+    fallback: Option<String>,
+}
+
+impl UsageSpanOutput {
+    fn append_delta(&mut self, item_id: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.remember_item(item_id);
+        self.text_by_item_id
+            .entry(item_id.to_string())
+            .or_default()
+            .push_str(delta);
+    }
+
+    fn set_item_text(&mut self, item_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.remember_item(item_id);
+        self.text_by_item_id
+            .insert(item_id.to_string(), text.to_string());
+    }
+
+    fn set_fallback_if_empty(&mut self, value: &str) {
+        if self.value().is_none() {
+            self.fallback = clean_string(Some(value));
+        }
+    }
+
+    fn value(&self) -> Option<String> {
+        let mut text = String::new();
+        for item_id in &self.item_order {
+            if let Some(item_text) = self.text_by_item_id.get(item_id) {
+                text.push_str(item_text);
+            }
+        }
+        clean_string(Some(&text)).or_else(|| self.fallback.clone())
+    }
+
+    fn remember_item(&mut self, item_id: &str) {
+        if self.text_by_item_id.contains_key(item_id) {
+            return;
+        }
+        self.item_order.push(item_id.to_string());
+        self.text_by_item_id
+            .insert(item_id.to_string(), String::new());
+    }
+}
+
+fn append_usage_span_output(event: &NormalizedEvent, output: &mut UsageSpanOutput) {
+    match event {
+        NormalizedEvent::AssistantMessage { content, .. } => {
+            for item in content {
+                if let NormalizedContent::AgentText { item_id, text } = item {
+                    output.set_item_text(item_id, text);
+                }
+            }
+        }
+        NormalizedEvent::AgentTextDelta { item_id, delta } => output.append_delta(item_id, delta),
+        NormalizedEvent::Error { message } => output.set_fallback_if_empty(message),
+        _ => {}
+    }
 }
 
 fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState) -> Result<()> {
@@ -1192,6 +1462,7 @@ pub(crate) fn write_blocks_error<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
 
     fn temp_upload_dir() -> PathBuf {
         let path = env::temp_dir().join(format!("harness-server-test-{}", Uuid::new_v4().simple()));
@@ -1249,6 +1520,81 @@ mod tests {
     }
 
     #[test]
+    fn parses_attachment_ref_as_recoverable_reference() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"inspect this"},{"type":"attachment_ref","attachment_id":"att_123","name":"report.pdf","mime_type":"application/pdf"}]}}"#;
+        let BlocksCommand::User { input, .. } = parse_blocks_line(line).expect("parses") else {
+            panic!("expected user command");
+        };
+
+        assert_eq!(input.len(), 2);
+        let UserInput::Text { text, .. } = &input[1] else {
+            panic!("expected attachment_ref to become text guidance");
+        };
+        assert!(text.contains("Attachment reference"));
+        assert!(text.contains("id=att_123"));
+        assert!(text.contains("name=report.pdf"));
+        assert!(text.contains("mime=application/pdf"));
+        assert!(text.contains("not preloaded in /home/agent/uploads"));
+        assert!(!text.contains("Unsupported attachment block type"));
+    }
+
+    #[test]
+    fn attachment_ref_downloads_to_uploads_dir_when_api_is_available() {
+        let upload_dir = temp_upload_dir();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let api_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = String::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if request.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(
+                request.starts_with("GET /agent/attachments/att_123/download?thread_key=web%3At1 ")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nhello-ref",
+                )
+                .expect("write response");
+        });
+
+        unsafe {
+            env::set_var("CENTAUR_API_URL", api_base);
+        }
+        let line = r#"{"type":"user","thread_key":"web:t1","message":{"role":"user","content":[{"type":"text","text":"inspect this"},{"type":"attachment_ref","attachment_id":"att_123","name":"report.txt","mime_type":"text/plain"}]}}"#;
+        let BlocksCommand::User { input, .. } = parse_blocks_line(line).expect("parses") else {
+            panic!("expected user command");
+        };
+        server.join().expect("server thread");
+
+        assert_eq!(input.len(), 2);
+        let UserInput::Text { text, .. } = &input[1] else {
+            panic!("expected attachment_ref to become text input");
+        };
+        assert!(text.contains("Attached file saved to"));
+        assert!(!text.contains("Unsupported attachment block type"));
+        let path = text
+            .strip_prefix("[Attached file saved to ")
+            .and_then(|value| value.strip_suffix(']'))
+            .map(PathBuf::from)
+            .expect("saved path");
+        assert!(path.starts_with(&upload_dir) || path.exists());
+        assert_eq!(
+            std::fs::read_to_string(path).expect("downloaded file"),
+            "hello-ref"
+        );
+    }
+
+    #[test]
     fn parses_blocks_user_line_with_provider_override() {
         let line = r#"{"type":"user","thread_key":"web:t1","provider":"amazon-bedrock","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
         let BlocksCommand::User { provider, .. } = parse_blocks_line(line).expect("parses") else {
@@ -1291,6 +1637,38 @@ mod tests {
             panic!("expected user command");
         };
         assert_eq!(reasoning, None);
+    }
+
+    #[test]
+    fn usage_span_output_replaces_delta_reconstruction_with_canonical_text() {
+        let mut output = UsageSpanOutput::default();
+        append_usage_span_output(
+            &NormalizedEvent::AgentTextDelta {
+                item_id: "msg-1".to_string(),
+                delta: "hel".to_string(),
+            },
+            &mut output,
+        );
+        append_usage_span_output(
+            &NormalizedEvent::AgentTextDelta {
+                item_id: "msg-1".to_string(),
+                delta: "lo".to_string(),
+            },
+            &mut output,
+        );
+        append_usage_span_output(
+            &NormalizedEvent::AssistantMessage {
+                partial: false,
+                stop_reason: Some("end_turn".to_string()),
+                content: vec![NormalizedContent::AgentText {
+                    item_id: "msg-1".to_string(),
+                    text: "hello".to_string(),
+                }],
+            },
+            &mut output,
+        );
+
+        assert_eq!(output.value().as_deref(), Some("hello"));
     }
 
     #[test]
@@ -1358,5 +1736,33 @@ mod tests {
         };
         assert!(text.starts_with("[Attached file saved to "));
         assert!(text.ends_with("notes.txt]"));
+    }
+
+    #[test]
+    fn inline_image_attachment_block_becomes_local_image_input() {
+        let _upload_dir = temp_upload_dir();
+        let mut state = BlocksState::default();
+        let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"attachment","attachment_type":"image","dataBase64":"aGVsbG8=","name":"image.png","mimeType":"image/png","size":5}]}}"#;
+        let BlocksCommand::User { input, .. } =
+            parse_blocks_line_with_state(user, &mut state).expect("user parses")
+        else {
+            panic!("expected user command");
+        };
+
+        assert_eq!(input.len(), 2);
+        let UserInput::Text { text, .. } = &input[0] else {
+            panic!("expected image attachment notice");
+        };
+        assert!(text.starts_with("[Attached image saved to "));
+        assert!(text.ends_with("image.png]"));
+
+        let UserInput::LocalImage { path, .. } = &input[1] else {
+            panic!("expected inline image attachment to become a local image");
+        };
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("image.png")
+        );
+        assert_eq!(std::fs::read(path).expect("read image bytes"), b"hello");
     }
 }

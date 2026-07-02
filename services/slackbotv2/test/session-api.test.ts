@@ -2,8 +2,11 @@ import { describe, expect, test } from 'bun:test'
 import {
   clearConversationNameCacheForTests,
   clearRequesterIdentityCacheForTests,
+  DEFAULT_SESSION_IDLE_TIMEOUT_MS,
   forwardToSessionApi,
   harnessRestartPreamble,
+  openSessionEventStream,
+  serializeAttachment,
   serializeMessage
 } from '../src/session-api'
 import { renderSlackDisplayText } from '../src/slack-display-text'
@@ -98,9 +101,13 @@ function options(fetchFn: SlackbotV2Options['fetch']): SlackbotV2Options {
   }
 }
 
-function executeLine(requests: RecordedRequest[]): JsonObject {
+function executeBody(requests: RecordedRequest[]): Record<string, unknown> {
   const execute = requests.find(request => request.url.endsWith('/execute'))
-  const inputLines = (execute?.body as { input_lines: string[] }).input_lines
+  return (execute?.body ?? {}) as Record<string, unknown>
+}
+
+function executeLine(requests: RecordedRequest[]): JsonObject {
+  const inputLines = (executeBody(requests) as { input_lines: string[] }).input_lines
   return JSON.parse(inputLines[0]!) as JsonObject
 }
 
@@ -122,9 +129,63 @@ function lineContent(line: JsonObject): JsonObject[] {
   return Array.isArray(message.content) ? message.content.filter(isJsonRecord) : []
 }
 
+function textPartIncludes(part: JsonObject, text: string): boolean {
+  return typeof part.text === 'string' && part.text.includes(text)
+}
+
 function isJsonRecord(value: JsonValue | undefined): value is JsonObject {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
+
+describe('session event streaming', () => {
+  test('passes activity summary events through to the renderer source stream', async () => {
+    const encoded = new TextEncoder().encode(
+      [
+        'id: 1',
+        'event: session.activity_summary',
+        'data: {"summary":"The agent is reading App Server events."}',
+        '',
+        'id: 2',
+        'event: session.execution_completed',
+        'data: {"result_text":"done"}',
+        '',
+      ].join('\n')
+    )
+    const fetchFn: SlackbotV2Options['fetch'] = async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoded)
+            controller.close()
+          }
+        }),
+        { headers: { 'content-type': 'text/event-stream' } }
+      )
+    const seenEventIds: number[] = []
+
+    const stream = await openSessionEventStream(options(fetchFn), {
+      afterEventId: 0,
+      executionId: 'exec-1',
+      onEventId: eventId => seenEventIds.push(eventId),
+      threadId: 'slack:C1:1700000000.000100'
+    })
+    const events = []
+    for await (const event of stream) events.push(event)
+
+    expect(events[0]).toEqual({
+      data: { summary: 'The agent is reading App Server events.' },
+      event: 'session.activity_summary',
+      eventId: 1,
+      eventKind: 'session.activity_summary'
+    })
+    expect(events[1]).toMatchObject({
+      event: 'session.execution_completed',
+      eventId: 2,
+      eventKind: 'session.execution_completed'
+    })
+    expect(seenEventIds).toEqual([1, 2])
+  })
+})
 
 describe('Slack display text fallback', () => {
   test('serializeMessage extracts raw Slack blocks when adapter text is empty', async () => {
@@ -201,6 +262,36 @@ describe('Slack display text fallback', () => {
     expect(lineContent(line).at(-1)).toEqual({ type: 'text', text: expected })
   })
 
+  test('includes API-owned Slack upload destination in visible Codex input', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('make an image')))
+
+    const context = lineContent(executeLine(requests)).find(part =>
+      typeof part.text === 'string' && part.text.includes('# Slack Session Context')
+    )
+    expect(context?.text).toContain('session_context.slack.channel_id: C1')
+    expect(context?.text).toContain('session_context.slack.thread_ts: 1700000000.000100')
+    expect(context?.text).toContain('thread_key: slack:C1:1700000000.000100')
+    expect(context?.text).toContain('slack upload C1 /path/to/file --thread 1700000000.000100')
+    expect(context?.text).toContain('Do not recover this destination with Slack search.')
+  })
+
+  test('includes team id for team-qualified Slack thread keys', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(
+      options(fetchFn),
+      forwardInput(apiMessage('make an image', { threadId: 'slack:T1:C1:1700000000.000100' }))
+    )
+
+    const context = lineContent(executeLine(requests)).find(part =>
+      typeof part.text === 'string' && part.text.includes('# Slack Session Context')
+    )
+    expect(context?.text).toContain('session_context.slack.team_id: T1')
+    expect(context?.text).toContain('session_context.slack.channel_id: C1')
+    expect(context?.text).toContain('session_context.slack.thread_ts: 1700000000.000100')
+    expect(context?.text).toContain('thread_key: slack:T1:C1:1700000000.000100')
+  })
+
   test('uses raw Slack block text in prior thread context instead of no text', async () => {
     const { fetchFn, requests } = fakeApi()
     const root = apiMessage('', {
@@ -262,6 +353,96 @@ describe('Slack display text fallback', () => {
     )
     expect(lineContent(line).at(-1)).toEqual({ type: 'text', text: expected })
   })
+
+  test('forwards hidden Slack message links with non-empty adapter text', async () => {
+    const { fetchFn, requests } = fakeApi()
+    const slackUrl = 'https://acme.slack.com/archives/C1234567890/p1700000000000100'
+    const serialized = await serializeMessage({
+      attachments: [],
+      author: {
+        fullName: 'Test User',
+        isBot: false,
+        isMe: false,
+        userId: 'U1',
+        userName: 'test'
+      },
+      id: '1700000000.000100',
+      isMention: true,
+      links: [],
+      metadata: { dateSent: new Date('2026-06-10T00:00:00.000Z') },
+      raw: {
+        blocks: [
+          {
+            elements: [
+              {
+                elements: [
+                  { text: 'continue', type: 'text' },
+                  { text: 'source thread', type: 'link', url: slackUrl }
+                ],
+                type: 'rich_text_section'
+              }
+            ],
+            type: 'rich_text'
+          }
+        ],
+        team_id: 'T1'
+      },
+      text: 'continue',
+      threadId: 'slack:C1:1700000000.000100'
+    } as unknown as Parameters<typeof serializeMessage>[0])
+
+    await forwardToSessionApi(options(fetchFn), forwardInput(serialized))
+
+    expect(serialized.links).toEqual([{ isSlackMessage: true, url: slackUrl }])
+    const expected = [
+      'continue',
+      '',
+      'Links included in the Slack message:',
+      'If the request is context-dependent, inspect linked Slack message/thread links before responding.',
+      `- Slack message/thread: ${slackUrl}`
+    ].join('\n')
+    expect(appendedTextParts(requests)).toContain(expected)
+
+    const line = executeLine(requests)
+    expect(line.trace_metadata).toEqual(
+      expect.objectContaining({
+        slack_link_count: 1,
+        slack_text_source: 'text'
+      })
+    )
+    expect(lineContent(line).at(-1)).toEqual({ type: 'text', text: expected })
+  })
+
+  test('does not duplicate links already visible in Slack text', async () => {
+    const { fetchFn, requests } = fakeApi()
+    const slackUrl = 'https://acme.slack.com/archives/C1234567890/p1700000000000100'
+    const message = apiMessage(`continue (${slackUrl})`, {
+      links: [{ isSlackMessage: true, url: slackUrl }]
+    })
+
+    await forwardToSessionApi(options(fetchFn), forwardInput(message))
+
+    expect(appendedTextParts(requests)).toContain(`continue (${slackUrl})`)
+    expect(appendedTextParts(requests).join('\n')).not.toContain('Links included in the Slack message')
+  })
+})
+
+describe('Slack attachment serialization', () => {
+  test('records timeout errors when attachment fetchData hangs', async () => {
+    const fetchFn = (async () => Response.json({ ok: true })) as SlackbotV2Options['fetch']
+    const startedAt = Date.now()
+    const attachment = await serializeAttachment(
+      {
+        fetchData: () => new Promise<Buffer>(() => undefined),
+        name: 'hung.txt',
+        type: 'file'
+      } as Parameters<typeof serializeAttachment>[0],
+      { ...options(fetchFn), slackApiTimeoutMs: 25 }
+    )
+
+    expect(Date.now() - startedAt).toBeLessThan(500)
+    expect(attachment.fetchError).toBe('fetch Slack attachment timed out after 25ms')
+  })
 })
 
 describe('forwardToSessionApi overrides', () => {
@@ -296,7 +477,7 @@ describe('forwardToSessionApi overrides', () => {
     expect(inputLines).toHaveLength(1)
     const line = JSON.parse(inputLines[0]!)
     expect(line.model).toBe('claude-sonnet-4-6')
-    expect(line.message.content[0].text).toContain('# Requester Context')
+    expect(lineContent(line).some(part => textPartIncludes(part, '# Requester Context'))).toBe(true)
     expect(line.message.content.at(-1)).toEqual({ type: 'text', text: 'review this' })
   })
 
@@ -325,6 +506,31 @@ describe('forwardToSessionApi overrides', () => {
     const execute = requests.find(request => request.url.endsWith('/execute'))
     const line = JSON.parse((execute?.body as { input_lines: string[] }).input_lines[0]!)
     expect('reasoning' in line).toBe(false)
+  })
+
+  test('includes default idle timeout on execute requests', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(options(fetchFn), forwardInput(apiMessage('hi')))
+    expect(executeBody(requests).idle_timeout_ms).toBe(DEFAULT_SESSION_IDLE_TIMEOUT_MS)
+  })
+
+  test('caps default idle timeout to max duration on execute requests', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(
+      { ...options(fetchFn), maxDurationMs: 60_000 },
+      forwardInput(apiMessage('hi'))
+    )
+    expect(executeBody(requests).idle_timeout_ms).toBe(60_000)
+    expect(executeBody(requests).max_duration_ms).toBe(60_000)
+  })
+
+  test('allows idle timeout override on execute requests', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await forwardToSessionApi(
+      { ...options(fetchFn), idleTimeoutMs: 12_345 },
+      forwardInput(apiMessage('hi'))
+    )
+    expect(executeBody(requests).idle_timeout_ms).toBe(12_345)
   })
 
   test('retries session creation with existing harness on 409 conflict', async () => {
@@ -442,15 +648,20 @@ describe('forwardToSessionApi harness restart', () => {
     expect(restarted).toBe(true)
     const execute = requests.find(request => request.url.endsWith('/execute'))
     const line = JSON.parse((execute?.body as { input_lines: string[] }).input_lines[0]!)
-    const [requesterContext, preamble, current] = line.message.content
-    expect(requesterContext.type).toBe('text')
-    expect(requesterContext.text).toContain('# Requester Context')
-    expect(requesterContext.text).not.toContain('restarted on a different agent harness')
-    expect(preamble.type).toBe('text')
-    expect(preamble.text).toContain('restarted on a different agent harness')
-    expect(preamble.text).toContain('[test]: earlier question')
-    expect(preamble.text).toContain('[assistant]: earlier answer')
-    expect(preamble.text).not.toContain('continue with codex')
+    const content = lineContent(line)
+    const requesterContext = content.find(part => textPartIncludes(part, '# Requester Context'))
+    const preamble = content.find(part =>
+      textPartIncludes(part, 'restarted on a different agent harness')
+    )
+    const current = content.at(-1)
+    expect(requesterContext?.type).toBe('text')
+    expect(requesterContext?.text).toContain('# Requester Context')
+    expect(requesterContext?.text).not.toContain('restarted on a different agent harness')
+    expect(preamble?.type).toBe('text')
+    expect(preamble?.text).toContain('restarted on a different agent harness')
+    expect(preamble?.text).toContain('[test]: earlier question')
+    expect(preamble?.text).toContain('[assistant]: earlier answer')
+    expect(preamble?.text).not.toContain('continue with codex')
     expect(current).toEqual({ type: 'text', text: 'continue with codex' })
   })
 
@@ -466,8 +677,11 @@ describe('forwardToSessionApi harness restart', () => {
     expect(restarted).toBe(false)
     const execute = requests.find(request => request.url.endsWith('/execute'))
     const line = JSON.parse((execute?.body as { input_lines: string[] }).input_lines[0]!)
-    expect(line.message.content[0].text).toContain('# Requester Context')
-    expect(line.message.content[0].text).not.toContain('restarted on a different agent harness')
+    const requesterContext = lineContent(line).find(part =>
+      textPartIncludes(part, '# Requester Context')
+    )
+    expect(requesterContext?.text).toContain('# Requester Context')
+    expect(requesterContext?.text).not.toContain('restarted on a different agent harness')
     expect(line.message.content.at(-1)).toEqual({ type: 'text', text: 'plain message' })
   })
 })
@@ -529,6 +743,81 @@ describe('session principal display name', () => {
       globalThis.fetch = realFetch
     }
   }
+
+  test('uses the GitHub handle from the requester Slack profile for PR attribution', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await withSlackStub(
+      url => {
+        if (url.includes('conversations.info')) {
+          return Response.json({ channel: { id: 'C1', name_normalized: 'eng-oncall' }, ok: true })
+        }
+        if (url.includes('users.profile.get')) {
+          return Response.json({
+            ok: true,
+            profile: {
+              display_name: 'Ada Lovelace',
+              fields: {
+                XfGithub: { label: 'GitHub', value: 'https://github.com/ada-lovelace' }
+              },
+              name: 'ada'
+            }
+          })
+        }
+        if (url.includes('users.info')) {
+          return Response.json({ ok: true, user: { profile: { display_name: 'Ada Lovelace' } } })
+        }
+        return Response.json({ ok: true })
+      },
+      async () => {
+        await forwardToSessionApi(slackOptions(fetchFn), forwardInput(apiMessage('please PR')))
+      }
+    )
+
+    const requesterContext = lineContent(executeLine(requests)).find(part =>
+      textPartIncludes(part, '# Requester Context')
+    )
+    expect(requesterContext?.text).toContain('GitHub handle from Slack profile: @ada-lovelace')
+    expect(requesterContext?.text).toContain('Prompted by: @ada-lovelace')
+    expect(requesterContext?.text).toContain('Assign the PR to the requester when possible: `ada-lovelace`')
+  })
+
+  test('uses the requester Slack display name for PR attribution when no GitHub handle exists', async () => {
+    const { fetchFn, requests } = fakeApi()
+    await withSlackStub(
+      url => {
+        if (url.includes('conversations.info')) {
+          return Response.json({ channel: { id: 'C1', name_normalized: 'eng-oncall' }, ok: true })
+        }
+        if (url.includes('users.profile.get')) {
+          return Response.json({
+            ok: true,
+            profile: {
+              display_name: 'Ada Lovelace',
+              fields: {},
+              name: 'ada'
+            }
+          })
+        }
+        if (url.includes('users.info')) {
+          return Response.json({ ok: true, user: { profile: { display_name: 'Ada Lovelace' } } })
+        }
+        return Response.json({ ok: true })
+      },
+      async () => {
+        await forwardToSessionApi(slackOptions(fetchFn), forwardInput(apiMessage('please PR')))
+      }
+    )
+
+    const requesterContext = lineContent(executeLine(requests)).find(part =>
+      textPartIncludes(part, '# Requester Context')
+    )
+    expect(requesterContext?.text).toContain('GitHub handle from Slack profile: unavailable')
+    expect(requesterContext?.text).toContain('Prompted by: Ada Lovelace')
+    expect(requesterContext?.text).toContain(
+      'Use the requester\'s Slack display name or username because no verified GitHub handle is available.'
+    )
+    expect(requesterContext?.text).not.toContain('Omit the `Prompted by` line')
+  })
 
   test('channel sessions name the principal after the channel', async () => {
     const { fetchFn, requests } = fakeApi()

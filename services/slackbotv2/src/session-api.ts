@@ -1,11 +1,12 @@
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
-import type { Attachment, Message } from 'chat'
+import type { Attachment, LinkPreview, Message } from 'chat'
 import { renderSlackDisplayText, slackMessagePromptText } from './slack-display-text'
 import type {
   ForwardSessionInput,
   JsonObject,
   JsonValue,
   SlackbotV2ApiAttachment,
+  SlackbotV2ApiMessageLink,
   SlackbotV2ApiMessage,
   SlackbotV2AppendMessagesRequest,
   SlackbotV2CreateSessionRequest,
@@ -17,6 +18,7 @@ import type {
   SlackbotV2SessionMessage
 } from './types'
 import { observeSeconds, slackbotMetrics } from './metrics'
+import { rawSlackUserId } from './slack-user'
 import {
   elapsedMs,
   errorMessage,
@@ -60,8 +62,17 @@ export function isRetryableSessionApiError(error: unknown): boolean {
   return error.name === 'AbortError' || error.name === 'TypeError'
 }
 
+export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 3 * 60 * 60 * 1000
 const DEFAULT_SESSION_API_TIMEOUT_MS = 30_000
 const DEFAULT_SLACK_API_TIMEOUT_MS = 5_000
+
+function sessionIdleTimeoutMs(options: SlackbotV2Options): number {
+  if (options.idleTimeoutMs !== undefined) return options.idleTimeoutMs
+  if (options.maxDurationMs !== undefined) {
+    return Math.min(DEFAULT_SESSION_IDLE_TIMEOUT_MS, options.maxDurationMs)
+  }
+  return DEFAULT_SESSION_IDLE_TIMEOUT_MS
+}
 
 class FetchTimeoutError extends Error {
   constructor(action: string, timeoutMs: number) {
@@ -138,8 +149,16 @@ function sessionApiTimeoutMs(options: SlackbotV2Options): number {
   return options.sessionApiTimeoutMs ?? DEFAULT_SESSION_API_TIMEOUT_MS
 }
 
-function slackApiTimeoutMs(options: SlackbotV2Options): number {
+export function slackApiTimeoutMs(options: SlackbotV2Options): number {
   return options.slackApiTimeoutMs ?? DEFAULT_SLACK_API_TIMEOUT_MS
+}
+
+export async function withSlackApiTimeout<T>(
+  options: SlackbotV2Options | undefined,
+  action: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  return options ? withTimeout(action, slackApiTimeoutMs(options), fn) : fn()
 }
 
 type ForwardSessionApiCallbacks = {
@@ -147,7 +166,7 @@ type ForwardSessionApiCallbacks = {
   onMessagesAppended?(): Promise<void>
   /**
    * Fires when session creation restarted the thread onto a new harness
-   * (explicit --claude/--amp/--codex on a thread pinned to another harness).
+   * (sticky --claude/--amp/--codex state on a thread pinned to another harness).
    * Runs before append/execute, so the callback may set
    * `input.contextPreamble` to re-feed thread history to the fresh harness.
    */
@@ -156,7 +175,8 @@ type ForwardSessionApiCallbacks = {
 
 export async function collectInitialContext(
   thread: { allMessages: AsyncIterable<Message> },
-  currentMessage: Message
+  currentMessage: Message,
+  options?: SlackbotV2Options
 ): Promise<SlackbotV2ApiMessage[]> {
   const messages: Message[] = []
   try {
@@ -165,7 +185,7 @@ export async function collectInitialContext(
     }
   } catch (error) {
     if (!isSlackThreadNotFoundError(error)) throw error
-    return [await serializeMessage(currentMessage)]
+    return [await serializeMessage(currentMessage, options)]
   }
 
   const currentIndex = messages.findIndex(message => message.id === currentMessage.id)
@@ -177,7 +197,7 @@ export async function collectInitialContext(
 
   const serialized: SlackbotV2ApiMessage[] = []
   for (const message of messages) {
-    serialized.push(await serializeMessage(message))
+    serialized.push(await serializeMessage(message, options))
   }
   return serialized
 }
@@ -194,10 +214,18 @@ function isSlackThreadNotFoundError(error: unknown): boolean {
   return error instanceof Error && error.message.includes('thread_not_found')
 }
 
-export async function serializeMessage(message: Message): Promise<SlackbotV2ApiMessage> {
+export async function serializeMessage(
+  message: Message,
+  options?: SlackbotV2Options
+): Promise<SlackbotV2ApiMessage> {
   const attachments: SlackbotV2ApiAttachment[] = []
   for (const attachment of message.attachments) {
-    attachments.push(await serializeAttachment(attachment))
+    attachments.push(await serializeAttachment(attachment, options))
+  }
+  if (attachments.length === 0) {
+    for (const attachment of slackRawFileAttachments(message.raw, options)) {
+      attachments.push(await serializeAttachment(attachment, options))
+    }
   }
   const displayText = renderSlackDisplayText({ raw: message.raw, text: message.text })
 
@@ -214,6 +242,7 @@ export async function serializeMessage(message: Message): Promise<SlackbotV2ApiM
     displayTextSource: displayText.source,
     id: message.id,
     isMention: message.isMention === true,
+    links: serializeMessageLinks(message.links, message.raw),
     raw: message.raw,
     rawSlackAttachmentCount: displayText.rawAttachmentCount,
     rawSlackBlockCount: displayText.rawBlockCount,
@@ -222,6 +251,198 @@ export async function serializeMessage(message: Message): Promise<SlackbotV2ApiM
     threadId: message.threadId,
     timestamp: message.metadata.dateSent.toISOString()
   }
+}
+
+function slackRawFileAttachments(raw: unknown, options?: SlackbotV2Options): Attachment[] {
+  const files = slackRawFiles(raw)
+  if (files.length === 0) return []
+  return files.map(file => slackRawFileAttachment(file, raw, options))
+}
+
+function slackRawFiles(raw: unknown): JsonObject[] {
+  const records = slackRawRecords(raw)
+  const files: JsonObject[] = []
+  for (const record of records) {
+    const rawFiles = record.files
+    if (!Array.isArray(rawFiles)) continue
+    for (const file of rawFiles) {
+      if (isJsonObject(file)) files.push(file)
+    }
+  }
+  return files
+}
+
+function slackRawFileAttachment(
+  file: JsonObject,
+  raw: unknown,
+  options?: SlackbotV2Options
+): Attachment {
+  const url = stringValue(file.url_private_download) ?? stringValue(file.url_private)
+  const mimeType = stringValue(file.mimetype)
+  const fetchMetadata: Record<string, string> = {}
+  const teamId = slackTeamId(raw)
+  if (url) fetchMetadata.url = url
+  if (teamId) fetchMetadata.teamId = teamId
+  return {
+    fetchData: url && options ? () => fetchSlackRawFile(options, url) : undefined,
+    fetchMetadata: Object.keys(fetchMetadata).length > 0 ? fetchMetadata : undefined,
+    height: numberValue(file.original_h),
+    mimeType,
+    name: stringValue(file.name) ?? stringValue(file.title) ?? stringValue(file.id),
+    size: numberValue(file.size),
+    type: slackRawFileAttachmentType(mimeType),
+    url,
+    width: numberValue(file.original_w)
+  }
+}
+
+async function fetchSlackRawFile(options: SlackbotV2Options, url: string): Promise<Buffer> {
+  const fetchFn = options.fetch ?? fetch
+  const response = await fetchFn(url, {
+    headers: { authorization: `Bearer ${options.botToken}` }
+  })
+  if (!response.ok) {
+    throw new Error(`failed to fetch Slack file: ${response.status} ${response.statusText}`)
+  }
+  return Buffer.from(await response.arrayBuffer())
+}
+
+function slackRawFileAttachmentType(mimeType: string | undefined): Attachment['type'] {
+  if (mimeType?.startsWith('image/')) return 'image'
+  if (mimeType?.startsWith('video/')) return 'video'
+  if (mimeType?.startsWith('audio/')) return 'audio'
+  return 'file'
+}
+
+function numberValue(value: JsonValue | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+const SLACK_MESSAGE_URL_PATTERN = /^https:\/\/[^/\s]+\.slack\.com\/archives\/[A-Z0-9]+\/p\d+/i
+
+export function serializeMessageLinks(
+  links: readonly LinkPreview[] | undefined,
+  raw: unknown
+): SlackbotV2ApiMessageLink[] | undefined {
+  return normalizeApiLinks([
+    ...(links ?? []).map(serializeLinkPreview),
+    ...extractRawSlackLinks(raw)
+  ])
+}
+
+function serializeLinkPreview(link: LinkPreview): SlackbotV2ApiMessageLink {
+  return {
+    description: link.description,
+    imageUrl: link.imageUrl,
+    isSlackMessage: Boolean(link.fetchMessage) || isSlackMessageUrl(link.url),
+    siteName: link.siteName,
+    title: link.title,
+    url: link.url
+  }
+}
+
+function extractRawSlackLinks(raw: unknown): SlackbotV2ApiMessageLink[] {
+  const links: SlackbotV2ApiMessageLink[] = []
+  for (const record of slackRawRecords(raw)) {
+    extractRawSlackBlockLinks(record.blocks, links)
+    extractRawSlackTextLinks(record.text, links)
+    extractRawSlackAttachmentLinks(record.attachments, links)
+  }
+  return links
+}
+
+function slackRawRecords(raw: unknown): JsonObject[] {
+  const records: JsonObject[] = []
+  const seen = new Set<JsonObject>()
+  const add = (value: unknown): void => {
+    if (!isJsonObject(value) || seen.has(value)) return
+    records.push(value)
+    seen.add(value)
+  }
+
+  add(raw)
+  if (isJsonObject(raw)) {
+    add(raw.event)
+    add(raw.message)
+    if (isJsonObject(raw.event)) add(raw.event.message)
+  }
+  return records
+}
+
+function extractRawSlackBlockLinks(
+  value: JsonValue | undefined,
+  links: SlackbotV2ApiMessageLink[]
+): void {
+  if (!Array.isArray(value)) return
+  for (const block of value) extractRawSlackElementLinks(block, links)
+}
+
+function extractRawSlackElementLinks(
+  value: JsonValue | undefined,
+  links: SlackbotV2ApiMessageLink[]
+): void {
+  if (!isJsonObject(value)) return
+  if (value.type === 'link') {
+    const url = stringValue(value.url)
+    if (url) links.push({ isSlackMessage: isSlackMessageUrl(url), url })
+  }
+  for (const key of ['elements', 'fields']) {
+    const children = value[key]
+    if (Array.isArray(children)) {
+      for (const child of children) extractRawSlackElementLinks(child, links)
+    }
+  }
+  extractRawSlackElementLinks(value.text, links)
+  extractRawSlackElementLinks(value.accessory, links)
+}
+
+function extractRawSlackTextLinks(
+  value: JsonValue | undefined,
+  links: SlackbotV2ApiMessageLink[]
+): void {
+  const text = stringValue(value)
+  if (!text) return
+  for (const match of text.matchAll(/<([a-z]+:\/\/[^>|]+)(?:\|[^>]+)?>/gi)) {
+    const url = match[1]
+    if (url) links.push({ isSlackMessage: isSlackMessageUrl(url), url })
+  }
+}
+
+function extractRawSlackAttachmentLinks(
+  value: JsonValue | undefined,
+  links: SlackbotV2ApiMessageLink[]
+): void {
+  if (!Array.isArray(value)) return
+  for (const attachment of value) {
+    if (!isJsonObject(attachment)) continue
+    const url = stringValue(attachment.from_url) ?? stringValue(attachment.original_url)
+    if (!url) continue
+    links.push({
+      description: stringValue(attachment.text),
+      isSlackMessage: isSlackMessageUrl(url),
+      siteName: stringValue(attachment.service_name),
+      title: stringValue(attachment.title),
+      url
+    })
+  }
+}
+
+function normalizeApiLinks(
+  links: SlackbotV2ApiMessageLink[]
+): SlackbotV2ApiMessageLink[] | undefined {
+  const seen = new Set<string>()
+  const normalized: SlackbotV2ApiMessageLink[] = []
+  for (const link of links) {
+    const url = link.url.trim()
+    if (!url || seen.has(url)) continue
+    seen.add(url)
+    normalized.push({ ...link, url })
+  }
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function isSlackMessageUrl(url: string): boolean {
+  return SLACK_MESSAGE_URL_PATTERN.test(url)
 }
 
 function slackTeamId(raw: unknown): string | undefined {
@@ -382,7 +603,10 @@ export const MAX_INLINE_ATTACHMENT_BYTES = 100 * 1024 * 1024
 const MAX_CODEX_INPUT_LINE_CHARS = 900 * 1024
 const STAGED_ATTACHMENT_CHUNK_CHARS = 700 * 1024
 
-export async function serializeAttachment(attachment: Attachment): Promise<SlackbotV2ApiAttachment> {
+export async function serializeAttachment(
+  attachment: Attachment,
+  options?: SlackbotV2Options
+): Promise<SlackbotV2ApiAttachment> {
   const serialized: SlackbotV2ApiAttachment = {
     fetchMetadata: attachment.fetchMetadata,
     height: attachment.height,
@@ -400,7 +624,7 @@ export async function serializeAttachment(attachment: Attachment): Promise<Slack
   }
 
   try {
-    const data = attachment.data ?? (await attachment.fetchData?.())
+    const data = attachment.data ?? (await fetchAttachmentData(attachment, options))
     if (data) {
       // Re-check the actual byte count: Slack size metadata can be absent.
       const byteLength = Buffer.isBuffer(data) ? data.length : data.size
@@ -415,6 +639,17 @@ export async function serializeAttachment(attachment: Attachment): Promise<Slack
   }
 
   return serialized
+}
+
+async function fetchAttachmentData(
+  attachment: Attachment,
+  options?: SlackbotV2Options
+): Promise<Buffer | Blob | undefined> {
+  if (!attachment.fetchData) return undefined
+  if (!options) return attachment.fetchData()
+  return withSlackApiTimeout(options, 'fetch Slack attachment', () =>
+    attachment.fetchData?.() ?? Promise.resolve(undefined)
+  )
 }
 
 function attachmentTooLargeError(bytes: number): string {
@@ -477,8 +712,8 @@ async function createSession(
   message?: SlackbotV2ApiMessage
 ): Promise<CreateSessionOutcome> {
   const requested = harnessType ?? options.defaultHarnessType ?? DEFAULT_HARNESS_TYPE
-  // An explicit --claude/--amp/--codex restarts a thread pinned to another
-  // harness; the implicit default never forces a switch.
+  // A sticky --claude/--amp/--codex selection restarts a thread pinned to
+  // another harness; the implicit default never forces a switch.
   const response = await postCreateSession(
     options,
     threadId,
@@ -597,19 +832,6 @@ function messageRequesterUserId(message: SlackbotV2ApiMessage | undefined): stri
   const rawUserId = rawSlackUserId(message.raw)
   const authorUserId = stringValue(message.author.userId)
   return authorUserId ?? rawUserId
-}
-
-function rawSlackUserId(raw: unknown): string | undefined {
-  if (!isJsonObject(raw)) return undefined
-  const directUser = stringValue(raw.user)
-  if (directUser) return directUser
-  const user = raw.user
-  if (isJsonObject(user)) {
-    return stringValue(user.id) ?? stringValue(user.user_id)
-  }
-  const botProfile = raw.bot_profile
-  if (isJsonObject(botProfile)) return stringValue(botProfile.user_id)
-  return undefined
 }
 
 async function resolveRequesterIdentity(
@@ -824,7 +1046,7 @@ async function slackApiGet(
 ): Promise<JsonObject | null> {
   const url = slackApiMethodUrl(options.slackApiUrl, method)
   for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value)
-  return withTimeout(`Slack API ${method}`, slackApiTimeoutMs(options), async () => {
+  return withSlackApiTimeout(options, `Slack API ${method}`, async () => {
     const response = await fetchWithTimeout(
       fetch,
       url,
@@ -953,6 +1175,7 @@ async function executeSession(
 ): Promise<SlackbotV2ExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch
   const requesterIdentity = await resolveRequesterIdentity(options, message)
+  const idleTimeoutMs = sessionIdleTimeoutMs(options)
   const body: SlackbotV2ExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(message, { action: 'execute' }, requesterIdentity),
@@ -966,7 +1189,7 @@ async function executeSession(
       reasoning,
       provider
     ),
-    ...(options.idleTimeoutMs === undefined ? {} : { idle_timeout_ms: options.idleTimeoutMs }),
+    idle_timeout_ms: idleTimeoutMs,
     ...(options.maxDurationMs === undefined ? {} : { max_duration_ms: options.maxDurationMs })
   }
   const response = await fetchWithTimeout(
@@ -1131,6 +1354,7 @@ function sessionSlackTextMetadata(message: SlackbotV2ApiMessage): JsonObject {
   if (typeof message.rawSlackAttachmentCount === 'number') {
     fields.slack_raw_attachment_count = message.rawSlackAttachmentCount
   }
+  if (message.links?.length) fields.slack_link_count = message.links.length
   return fields
 }
 
@@ -1255,6 +1479,7 @@ function stagedAttachmentInputLines(
 
 function requesterIdentityContext(identity: RequesterIdentity | undefined): string | undefined {
   if (!identity?.slackUserId && !identity?.slackUserName && !identity?.githubHandle) return undefined
+  const slackAttributionName = requesterSlackAttributionName(identity)
 
   const lines = [
     '# Requester Context',
@@ -1282,6 +1507,7 @@ function requesterIdentityContext(identity: RequesterIdentity | undefined): stri
       `- Assign the PR to the requester when possible: \`${githubLogin}\``
     )
   } else {
+    const promptedBy = slackAttributionName ?? 'unknown Slack requester'
     lines.push(
       '- GitHub handle from Slack profile: unavailable',
       `- GitHub handle unavailable reason: ${identity.githubUnavailableReason ?? 'not resolved'}`,
@@ -1289,14 +1515,32 @@ function requesterIdentityContext(identity: RequesterIdentity | undefined): stri
       '',
       '## GitHub PR Attribution',
       '',
-      '- If you create a GitHub PR for this Slack request, do not infer a GitHub '
-        + 'username from Slack display name, real name, or email.',
-      '- Omit the `Prompted by` line unless a verified GitHub handle is present.'
+      '- If you create a GitHub PR for this Slack request, '
+        + `the PR body MUST contain this standalone line: \`Prompted by: ${promptedBy}\``,
+      '- Use the requester\'s Slack display name or username because no verified GitHub '
+        + 'handle is available.',
+      '- Do not infer a GitHub username from Slack display name, real name, or email.',
+      '- The credited prompter is the requester in this section, not the Slack thread OP/root author.',
+      '- This is a GitHub PR body requirement, not a Slack response mention rule.'
     )
   }
 
   lines.push('', 'The user message follows in the next content block.', '---')
   return lines.join('\n')
+}
+
+function requesterSlackAttributionName(identity: RequesterIdentity): string | undefined {
+  return (
+    nonEmptyString(identity.slackDisplayName)
+    ?? nonEmptyString(identity.slackUserName)
+    ?? nonEmptyString(identity.slackMention)
+    ?? nonEmptyString(identity.slackUserId)
+  )
+}
+
+function nonEmptyString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : undefined
 }
 
 function codexInputContent(
@@ -1307,6 +1551,10 @@ function codexInputContent(
   contextPreamble?: string
 ): JsonValue[] {
   const content: JsonValue[] = []
+  const slackSessionContext = slackUploadSessionContext(message.threadId)
+  if (slackSessionContext) {
+    content.push({ type: 'text', text: slackSessionContext })
+  }
   const requesterContext = requesterIdentityContext(requesterIdentity)
   if (requesterContext) {
     content.push({ type: 'text', text: requesterContext })
@@ -1338,6 +1586,45 @@ function codexInputContent(
     content.push(codexAttachmentInput(attachment, staged.get(attachment)))
   }
   return content.length > 0 ? content : [{ type: 'text', text: 'continue' }]
+}
+
+type SlackThreadDestination = {
+  channelId: string
+  teamId?: string
+  threadTs: string
+}
+
+function slackUploadSessionContext(threadId: string): string | undefined {
+  const destination = slackThreadDestination(threadId)
+  if (!destination) return undefined
+
+  const lines = [
+    '# Slack Session Context',
+    '',
+    'API-owned Slack upload destination for this turn:',
+    ...(destination.teamId ? [`- session_context.slack.team_id: ${destination.teamId}`] : []),
+    `- session_context.slack.channel_id: ${destination.channelId}`,
+    `- session_context.slack.thread_ts: ${destination.threadTs}`,
+    `- thread_key: ${threadId}`,
+    '',
+    'Use these exact IDs for Slack file uploads in this thread.',
+    `Example: slack upload ${destination.channelId} /path/to/file --thread ${destination.threadTs}`,
+    'Do not recover this destination with Slack search.',
+    '---'
+  ]
+  return lines.join('\n')
+}
+
+function slackThreadDestination(threadId: string): SlackThreadDestination | undefined {
+  const parts = threadId.split(':')
+  if (parts[0] !== 'slack') return undefined
+  if (parts.length === 3 && parts[1] && parts[2]) {
+    return { channelId: parts[1], threadTs: parts[2] }
+  }
+  if (parts.length === 4 && parts[1] && parts[2] && parts[3]) {
+    return { teamId: parts[1], channelId: parts[2], threadTs: parts[3] }
+  }
+  return undefined
 }
 
 function slackThreadContext(
@@ -1416,18 +1703,6 @@ function codexAttachmentInput(
       size: attachment.size
     }
   }
-  const dataUrl =
-    attachment.dataBase64 && attachment.mimeType
-      ? `data:${attachment.mimeType};base64,${attachment.dataBase64}`
-      : undefined
-  if (attachment.type === 'image' && (dataUrl || attachment.url)) {
-    return {
-      type: 'image',
-      url: dataUrl ?? attachment.url,
-      detail: 'auto',
-      name: attachment.name
-    }
-  }
   if (attachment.dataBase64) {
     return {
       type: 'attachment',
@@ -1476,6 +1751,15 @@ async function* parseSessionEventStream(
         eventKind: event.event
       } satisfies RustSessionStreamEvent
       if (isTerminalCodexOutputLine(event.data)) return
+      continue
+    }
+    if (event.event === 'session.activity_summary') {
+      yield {
+        data: sessionEventData(event),
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event
+      } satisfies RustSessionStreamEvent
       continue
     }
     if (event.event === 'session.execution_failed' || event.event === 'session.stream_error') {
